@@ -1,0 +1,17 @@
+{
+  "policy": "adaptive",
+  "downstream_rate_bu_per_h": 1000.0,
+  "total_completion_time_h": 62.230450708709625,
+  "productive_harvest_time_h": 60.56378404204305,
+  "blocked_time_h": 0.0,
+  "switching_time_h": 1.6666666666666656,
+  "number_of_field_switches": 5,
+  "combine_utilization": 0.9732178274833978,
+  "total_harvested_ac": 300.0000000000007,
+  "total_harvested_grain_bu": 60000.00000000287,
+  "total_processed_grain_bu": 59692.30769230542,
+  "final_buffer_bu": 307.6923076923092,
+  "maximum_buffer_bu": 307.6923076923092,
+  "average_buffer_bu": 117.94879235622442,
+  "mass_balance_error_bu": 0.0
+}
