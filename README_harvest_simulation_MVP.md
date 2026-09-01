@@ -1,5 +1,12 @@
 # Harvest–Downstream Coordination Simulation MVP
 
+> **Historical design document.** The equivalent-buffer downstream model and its
+> buffer thresholds, output schema, and example rates below have been superseded.
+> The current implementation uses a 500-bu combine tank, one 1000-bu semi,
+> delivery at 20 minutes, empty return at 45 minutes, and continuous GC processing
+> at 1000 bu/h with unlimited GC inventory. See [README.md](README.md) for the
+> current model, assumptions, parameters, run commands, and completion metrics.
+
 ## 1. Goal
 
 Build a minimal simulation to test whether **downstream-aware harvesting coordination** can reduce downstream-induced combine waiting when different field tasks naturally generate grain at different rates.
@@ -436,7 +443,7 @@ F2: rectangular
 F3: irregular
 F4: rectangular
 F5: irregular
-F6: rectangular
+F6: irregular
 ```
 
 Each field contains:
@@ -528,7 +535,11 @@ The purpose of this first run is only to validate:
 
 Only implement this after the sequential model is working correctly.
 
-The adaptive controller chooses among currently feasible tasks using downstream buffer state.
+The adaptive controller chooses the next field using downstream buffer state,
+only when no field has been started or the current field is complete. Once a
+field is started, its opening and interior harvest must both finish before any
+field switch. The task preferences below apply only at those decision points;
+they cannot interrupt an unfinished field.
 
 The controller should exploit **naturally available tasks with different grain-generation rates** rather than inventing arbitrary fast/slow combine modes.
 
@@ -588,31 +599,21 @@ style oscillation.
 
 # 16. Switching Decision Constraint
 
-A task should not be changed merely because another task has a more favorable instantaneous grain-generation rate.
-
-Switching costs 20 minutes.
-
-The controller should therefore favor task persistence.
-
-For the first rule-based version, use hysteresis plus a minimum-task-duration constraint if needed.
-
-Later versions can explicitly estimate whether:
+Both policies must complete the current field before switching to another field:
 
 ```text
-expected downstream waiting reduction > switching cost
+Field switch permitted only if:
+opening_remaining == 0 AND interior_remaining == 0
 ```
 
-before switching.
+This is a hard constraint enforced by the simulator, including during downstream
+blocking. Buffer thresholds and minimum task duration do not override it.
+Transitioning from opening to interior harvest in the same field costs no switch
+time. Moving to another field costs 20 minutes while downstream processing continues.
 
-Conceptually:
-
-```text
-Switch only if:
-
-Expected saved blocked time > 20 min
-```
-
-Do not implement prediction in the first MVP unless necessary.
+Adaptive control can change field order, but cannot interleave phases from
+different fields. Six initially unharvested fields therefore require five field
+switches under either policy.
 
 ---
 
@@ -1057,7 +1058,7 @@ B_max               = 1000 bu
 D                   = 1000 bu/h
 dt                  = 1 min
 Number of fields    = 6
-Field geometries    = 4 rectangular + 2 irregular
+Field geometries    = 3 rectangular + 3 irregular
 Adaptive thresholds = 800 / 400 bu
 ```
 

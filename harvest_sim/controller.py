@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .field import INTERIOR, OPENING, Field
+from .config import SimulationConfig
+from .field import INTERIOR, Field
 
 TaskRef = tuple[int, str]
 
@@ -24,34 +25,33 @@ class SequentialController:
 
 @dataclass
 class AdaptiveController:
-    high_buffer_bu: float
-    low_buffer_bu: float
-    min_task_h: float
+    config: SimulationConfig
     name: str = "adaptive"
 
     def choose(
         self,
         fields: list[Field],
         current: TaskRef | None,
-        buffer_bu: float,
-        task_elapsed_h: float = 0.0,
+        receiving_pressure: float,
         **_: float,
     ) -> TaskRef | None:
         feasible = [(i, task) for i, field in enumerate(fields) for task in field.available_tasks()]
         if not feasible:
             return None
         current_feasible = current in feasible
-        if current_feasible and task_elapsed_h < self.min_task_h:
+        c = self.config
+        if c.low_receiving_pressure_fraction < receiving_pressure < c.high_receiving_pressure_fraction and current_feasible:
             return current
-        if self.low_buffer_bu < buffer_bu < self.high_buffer_bu and current_feasible:
-            return current
-        if buffer_bu >= self.high_buffer_bu:
-            # Lower inflow first; stay in the current field on a tie.
-            rank = {("irregular", OPENING): 0, ("rectangular", OPENING): 1}
-            return min(feasible, key=lambda x: (rank.get((fields[x[0]].geometry, x[1]), 2), x[0] != (current or (-1, ""))[0], x[0]))
-        interiors = [task for task in feasible if task[1] == INTERIOR]
-        if buffer_bu <= self.low_buffer_bu and interiors:
-            if current in interiors:
-                return current
-            return min(interiors, key=lambda x: (x[0] != (current or (-1, ""))[0], x[0]))
+
+        def capacity(task: TaskRef) -> float:
+            if task[1] == INTERIOR:
+                return c.interior_capacity_acph
+            return (c.rectangular_opening_capacity_acph if fields[task[0]].geometry == "rectangular"
+                    else c.irregular_opening_capacity_acph)
+
+        # Use actual rates: editing config can make opening faster than interior.
+        if receiving_pressure >= c.high_receiving_pressure_fraction:
+            return min(feasible, key=lambda task: (capacity(task), task[0]))
+        if receiving_pressure <= c.low_receiving_pressure_fraction:
+            return min(feasible, key=lambda task: (-capacity(task), task[0]))
         return current if current_feasible else feasible[0]
