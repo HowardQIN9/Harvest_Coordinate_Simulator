@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from .config import SimulationConfig
+from .config import FieldSpec, SimulationConfig
 
 
 OPENING = "Opening"
@@ -11,12 +11,17 @@ INTERIOR = "InteriorHarvest"
 class Field:
     field_id: str
     geometry: str
+    moisture: str
+    one_way_travel_min: float
+    total_area_ac: float
     opening_remaining_ac: float
     interior_remaining_ac: float
 
     @classmethod
-    def create(cls, index: int, geometry: str, config: SimulationConfig) -> "Field":
-        return cls(f"F{index}", geometry, config.opening_area_ac, config.interior_area_ac)
+    def create(cls, spec: FieldSpec, config: SimulationConfig) -> "Field":
+        return cls(spec.field_id, spec.geometry, spec.moisture, spec.one_way_travel_min,
+                   spec.area_ac, config.opening_area_ac,
+                   spec.area_ac - config.opening_area_ac)
 
     @property
     def opening_complete(self) -> bool:
@@ -41,4 +46,3 @@ class Field:
             self.opening_remaining_ac = max(0.0, self.opening_remaining_ac - acres)
         else:
             self.interior_remaining_ac = max(0.0, self.interior_remaining_ac - acres)
-

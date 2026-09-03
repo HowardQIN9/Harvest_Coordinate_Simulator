@@ -1,140 +1,132 @@
 # Harvest Coordinate Simulator
 
-One combine, configurable semi trucks, and a grain center with continuous processing.
-The current model below supersedes the historical equivalent-buffer model in
-`README_harvest_simulation_MVP.md`.
+离散事件收获协调模拟器：一台联合收割机、一辆半挂车、接收坑、grain leg、wet bin 和 dryer。模型同时比较固定田块顺序与带前瞻计算的 adaptive 顺序。
 
-## Run
+## 运行
 
-From this project directory in PowerShell:
+在项目目录运行：
 
-```powershell
-python run_baseline.py --policy sequential
-python run_baseline.py --policy adaptive
-python run_baseline.py --policy adaptive --gc-rate 1500
-python run_experiments.py
-python -m unittest discover -s tests -v
+```bash
+python3 run_baseline.py --policy sequential
+python3 run_baseline.py --policy adaptive
+python3 run_experiments.py
+python3 -m unittest discover -s tests -v
 ```
 
-Only Python's standard library is required. Results go to `results/semi_transport/`
-by default, keeping older simulation outputs separate. Open SVG files in a browser.
-Each run produces:
+只使用 Python 标准库。默认结果写入 `results/wetbin_dryer/`：
 
-- `*_plots.svg`: full run, seven panels for field grain, semi loads, semi states,
-  GC inventory, combine state, harvested acreage, and cumulative grain.
-- `*_first3h.svg`: the first three hours, making individual transport events visible.
-- `*_metrics.json`: summary metrics.
-- `*_timeseries.csv`: inventories and states at time-step and event boundaries.
-- `*_transport_events.csv`: loading, departure, GC arrival, and field return events.
+- `*_metrics.json`：汇总指标；
+- `*_timeseries.csv`：每个时间步和事件边界的库存与状态；
+- `*_transport_events.csv`：装车、出发、到站、开始/完成卸货和返田事件；
+- `*_plots_20pt.svg`：完整仿真图；
+- `*_first3h_20pt.svg`：前三小时细节图。
 
-`--output-dir` and `--name-suffix` customize output paths. `--downstream-rate` is
-retained as an alias of `--gc-rate`; it now changes GC processing only. Without a
-rate flag, the runner uses the GC rate in `SimulationConfig`.
+所有图使用 20pt 字体，子图标题放在左侧竖排，并为标题、坐标和图例预留独立空间。
 
-## Physical model and parameters
+命令行可覆盖下游参数：
 
-Edit `harvest_sim/config.py`:
+```bash
+python3 run_baseline.py --policy adaptive \
+  --wet-bin-capacity 10000 \
+  --grain-leg-rate 3000 \
+  --dryer-high-rate 500 \
+  --dryer-low-rate 800 \
+  --name-suffix trial
+```
 
-| Parameter | Default | Meaning |
-| --- | --- | --- |
-| `combine_tank_capacity_bu` | 500 | Combine grain tank capacity |
-| `semi_count` | 1 | All trucks initially empty at the field |
-| `semi_capacity_bu` | 1000 | Capacity of each semi |
-| `semi_gc_arrival_h` | 20 / 60 | Time from departure to GC delivery |
-| `semi_round_trip_h` | 45 / 60 | Time from departure to empty return |
-| `grain_center_processing_rate_buph` | 1000 | Continuous GC processing rate |
-| `dt_h` | 1 / 60 | Maximum time step; events can shorten it |
-| `switch_time_h` | 20 / 60 | Combine travel time between fields |
+## 默认田块
 
-There is no ground storage. Grain enters the combine tank while harvesting.
-When the tank is full, it transfers grain instantly to an on-site semi with room,
-prioritizing the most-loaded semi. Normally two 500-bu transfers fill one truck.
-A full semi departs immediately. With no truck available, the combine can harvest
-until its own 500-bu tank is full; only then is the combine `BLOCKED`.
+表中的运输时间是单程分钟，不是英里。返程时间与去程相同。
 
-Each semi has independent states: `AT_FIELD -> TO_GC -> RETURNING -> AT_FIELD`.
-For a departure at time t, GC receives the truck's grain at t + 20 min, and the
-empty truck returns at t + 45 min. Loading and unloading consume no time. GC
-inventory has no capacity limit: a truck unloads immediately and returns without
-waiting for grain processing. GC processes at its configured rate whenever inventory is
-positive, and stops when empty. Processing never consumes grain before it arrives.
+| Field | Area (ac) | Geometry | Moisture | One-way transport (min) |
+| --- | ---: | --- | --- | ---: |
+| F1 | 50 | irregular | High | 5 |
+| F2 | 80 | rectangular | High | 15 |
+| F3 | 50 | irregular | Low | 20 |
+| F4 | 80 | rectangular | Low | 5 |
+| F5 | 50 | irregular | Low | 15 |
+| F6 | 80 | rectangular | Low | 20 |
 
-Assumptions for field changes: trucks at the field follow the combine without a
-separate relocation delay; returning trucks serve the combine's current field.
-The model does not track road distances between individual fields. Semi trips and
-GC processing continue during combine field switching and blocking.
+总面积为 390 ac；按 200 bu/ac 计算，总粮量为 78,000 bu。每块田先完成 10 ac Opening，再完成剩余面积的 InteriorHarvest。开始一块田以后，必须完成该田两个阶段才能换到下一块田；换田耗时 20 分钟。因此六块田固定产生五次换田，共 100 分钟。
 
-After harvest, remaining combine grain is transferred when a semi is available,
-and the last truckload may be partial. The simulation continues until all grain
-has been processed; it need not wait for already-empty trucks to return afterward.
+## 收割能力
 
-## Grain accounting and event records
+| 作业 | 能力 (ac/h) | 按 200 bu/ac 换算 (bu/h) |
+| --- | ---: | ---: |
+| InteriorHarvest | 7.5000 | 1500.00 |
+| Rectangular Opening | 6.6346 | 1326.92 |
+| Irregular Opening | 5.0481 | 1009.62 |
 
-At every recorded instant:
+Opening 速度保持独立，修改 interior 速度不会按比例重新缩放 Opening。
+
+## 运输与下游模型
+
+| 参数 | 默认值 | 含义 |
+| --- | ---: | --- |
+| Combine tank | 500 bu | 联合收割机粮箱容量 |
+| Semi count | 1 | 半挂车数量 |
+| Semi capacity | 1000 bu | 单车容量 |
+| Semi unload time | 10 min | 半挂车卸入接收坑的固定时间 |
+| Receiving pit | 1000 bu | 一车容量的站内接收坑 |
+| Grain leg | 3000 bu/h | 从接收坑送入 wet bin 的最大速度 |
+| Wet bin | 10000 bu | dryer 之前的湿粮仓容量 |
+| High-moisture dryer | 500 bu/h | F1、F2 的烘干速度 |
+| Low-moisture dryer | 800 bu/h | F3、F4、F5、F6 的烘干速度 |
+
+半挂车完整周期是：
 
 ```text
-harvested grain = combine tank
-                + grain on semis at the field
-                + grain on semis travelling to GC
-                + GC inventory
-                + processed grain
+5 min field:  5 去程 + 10 卸货 +  5 返程 = 20 min
+15 min field: 15 去程 + 10 卸货 + 15 返程 = 40 min
+20 min field: 20 去程 + 10 卸货 + 20 返程 = 50 min
 ```
 
-`field_grain_bu` is the sum of grain physically on the combine and on-site semis;
-it is NOT an extra storage pool. It drops when a loaded truck departs.
-`in_transit_grain_bu` drops and `grain_center_inventory_bu` jumps when a truck
-arrives at GC. Empty returning trucks carry no grain.
-
-Time-series rows with positive `duration_h` describe the interval ENDING at
-`time_h`. Instantaneous events have zero duration and may share a timestamp with
-the preceding row. Preserve these rows to plot true jumps and conserve grain.
-
-## Field completion and adaptive selection
-
-`field_geometries` defines the field set and initial order. The default is three
-rectangular and three irregular fields, each with 10 acres of opening and 40 acres
-of interior harvest. Both policies must finish `Opening` and `InteriorHarvest`
-before changing fields, even while blocked. Within-field phase transitions are
-free. Six fields require five field switches, totaling 100 minutes.
-
-Sequential visits fields in configuration order. Adaptive selects a new field
-only after the current field is complete. Its signal is receiving pressure:
+粮食流向为：
 
 ```text
-available space = free combine tank space + free space on on-site semis
-receiving pressure = 1 - available space
-                     / (combine capacity + semi count * semi capacity)
+combine tank -> semi -> receiving pit -> grain leg -> wet bin -> dryer
 ```
 
-Away trucks provide no receiving space, including empty trucks still returning.
-At pressure >= 0.80, prefer the available task with the lowest configured harvest
-rate; at pressure <= 0.40, prefer the highest rate; in between, use the current
-feasible task or configuration order. This is a simple heuristic, not a prediction
-of truck return times. The old minimum-task-duration setting is unnecessary under
-the hard whole-field constraint and has been removed.
+半挂车到站后，只有接收坑能够容纳整车粮食时才能开始固定 10 分钟卸货。Grain leg 是 wet bin 的输入设备，以最高 3000 bu/h 连续搬运。Dryer 按 wet bin 中粮食的先入先出顺序运行：队首为 High 时 500 bu/h，队首为 Low 时 800 bu/h。水分顺序不需要预先指定，速度由当前队首粮食自动决定。
 
-The current `interior_capacity_acph` is **7.5 ac/h**, giving **1500 bu/h** at
-200 bu/ac. Opening capacities remain independent: rectangular opening is about
-1326.92 bu/h and irregular opening about 1009.62 bu/h. Editing interior capacity
-does not rescale opening capacities.
+Wet bin 满时，grain leg 最多只能补入 dryer 同时排出的数量；接收坑随后可能装满，半挂车会在粮站等待，田间失去可用车辆后，combine tank 满载并进入 `BLOCKED`。因此 wet bin 和 dryer 会真实地向上游产生回压，而不是无限库存。
 
-## Completion metrics and experiments
+## Sequential 与 Adaptive
 
-- `harvest_completion_time_h`: when all fields are harvested.
-- `total_completion_time_h`: retained alias of harvest completion time.
-- `system_completion_time_h`: when all harvested grain is processed at GC.
-- `post_harvest_time_h`: extra time for final delivery and processing; not combine
-  blocked time and not included in combine utilization.
-- `*_at_harvest_completion_bu`: inventories at harvest completion, before final
-  flushing. Final total processed grain includes the post-harvest period.
+Sequential 始终按 F1 → F2 → F3 → F4 → F5 → F6 作业。
 
-Harvest completion time equals productive harvesting + field switching + blocking.
-`run_experiments.py` sweeps GC rates 600, 1000, 1500, 2000, 2500, and 3000 bu/h for
-both policies. With unlimited GC inventory and instantaneous unloading, changing
-GC speed changes inventory and system completion time, not truck availability or
-combine blocking. To explore transport-induced blocking, change harvest rates,
-truck count/capacity, round-trip time, or combine tank size.
+Adaptive 只在一整块田完成后重新决策。每个候选田都预测到该田结束，估算：
 
-Tests cover exact 20/45-minute events, simultaneous deliveries, coarse time steps,
-blocking only with a full tank and no semi, resumption on return, GC independence,
-final partial loads, field completion, and grain conservation.
+- Opening 与 Interior 的生产时间和产粮量；
+- 该田的“去程 + 10 分钟卸货 + 返程”运输吞吐；
+- 当前可用的 combine/semi、接收坑和 wet bin 剩余空间；
+- 当前队首粮食及候选田水分对应的 dryer 能力；
+- 预计运输回压、dryer 回压和该田结束后留给后续田块的库存。
+
+预测得分最低的田先做。该计算是轻量确定性前瞻，而不是完整复制未来事件仿真；实际执行仍使用逐事件的物理模型。
+
+## 粮食守恒
+
+每个记录时刻满足：
+
+```text
+harvested grain
+  = combine tank
+  + grain on every semi（田间、运输中、站内等待或卸货中）
+  + receiving pit
+  + wet bin
+  + dried grain
+```
+
+车辆到站不会直接清空成“消失”：粮食保留在车上直到 10 分钟卸货完成，然后批量进入接收坑；之后以 grain leg 和 dryer 的连续速率逐级转移。
+
+## 默认结果含义
+
+- `harvest_completion_time_h`：所有田块完成收割的时刻；
+- `system_completion_time_h`：全部 78,000 bu 完成烘干的时刻；
+- `blocked_time_h`：combine tank 满且没有可接粮半挂车造成的停机；
+- `post_harvest_time_h`：收割完成后继续运输与烘干的时间；
+- `maximum_receiving_pit_inventory_bu` 和 `maximum_wet_bin_inventory_bu`：容量约束检查；
+- `mass_balance_error_bu`：最终粮食守恒误差。
+
+自动测试覆盖三种运输周期、10 分钟卸货、grain leg 速度、湿粮仓回压、High/Low FIFO dryer 切换、整田约束、自适应前瞻、逐时刻粮食守恒和所有容量上限。
