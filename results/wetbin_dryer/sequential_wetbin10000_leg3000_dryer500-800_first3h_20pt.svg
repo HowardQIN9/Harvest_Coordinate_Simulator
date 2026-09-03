@@ -2,7 +2,7 @@
 <rect width="100%" height="100%" fill="white"/>
 <style>text {font-family:Arial,sans-serif;fill:#1e293b;font-size:20pt} .tick {font-size:20pt;fill:#64748b} .main-title {font-size:28pt;font-weight:bold}</style>
 <text class="main-title" x="210" y="42">Harvest / transport / wet-bin simulation — sequential</text>
-<text x="210" y="82">Wet bin 10000 bu | Grain leg 3000 bu/h | Dryer High 500, Low 800 bu/h</text>
+<text x="210" y="82">Wet bin 10000 bu | Grain leg 3000 bu/h | Dryer first 2 fields 500, remaining fields 800 bu/h</text>
 <text x="210" y="118">Trips use 5, 15, or 20 min outbound + 10 min unload + equal return time</text>
 <text x="48" y="270.00" text-anchor="middle" font-weight="bold" transform="rotate(-90 48 270.00)">Field grain (bu)</text>
 <rect x="210" y="160" width="1530" height="220" fill="#f8fafc"/>
@@ -128,9 +128,9 @@
 <rect x="210" y="1752" width="20" height="20" fill="#0891b2"/>
 <text x="239" y="1772">Total wet bin</text>
 <rect x="454" y="1752" width="20" height="20" fill="#dc2626"/>
-<text x="483" y="1772">High moisture</text>
-<rect x="698" y="1752" width="20" height="20" fill="#16a34a"/>
-<text x="727" y="1772">Low moisture</text>
+<text x="483" y="1772">Order 1-2: 500</text>
+<rect x="712" y="1752" width="20" height="20" fill="#16a34a"/>
+<text x="741" y="1772">Order 3-6: 800</text>
 <text x="48" y="1920.00" text-anchor="middle" font-weight="bold" transform="rotate(-90 48 1920.00)">Dryer rate (bu/h)</text>
 <rect x="210" y="1810" width="1530" height="220" fill="#f8fafc"/>
 <line x1="210.00" x2="210.00" y1="1810" y2="2030" stroke="#e2e8f0"/>

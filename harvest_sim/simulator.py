@@ -51,6 +51,14 @@ class Simulator:
         harvest_end_inventory: dict[str, Any] = {}
         series: list[dict[str, Any]] = []
 
+        def begin_field(field_index: int) -> None:
+            field = self.fields[field_index]
+            if field.moisture:
+                return
+            field.moisture = c.moisture_for_harvest_position(len(field_order))
+            d.set_field_context(field.field_id, field.one_way_travel_min)
+            field_order.append(field.field_id)
+
         def record(state: str, active: TaskRef | None, duration_h: float = 0.0,
                    event: str = "") -> None:
             mass_error = generated_bu - d.total_dried_bu - d.unprocessed_grain_bu
@@ -70,6 +78,7 @@ class Simulator:
                 "duration_h": duration_h,
                 "current_field": self.fields[active[0]].field_id if active else "",
                 "current_task": active[1] if active else "",
+                "current_moisture": self.fields[active[0]].moisture if active else "",
                 "combine_state": state,
                 "event": event,
                 "cumulative_harvested_ac": harvested_ac,
@@ -120,9 +129,7 @@ class Simulator:
                     if current is None:
                         raise AssertionError("Field switch has no destination")
                     combine_field = current[0]
-                    field = self.fields[combine_field]
-                    d.set_field_context(field.field_id, field.one_way_travel_min)
-                    field_order.append(field.field_id)
+                    begin_field(combine_field)
                 continue
 
             # A selected field must finish both phases before another field can start.
@@ -146,6 +153,7 @@ class Simulator:
                     field_mobile_free_bu=field_mobile_free,
                     system_buffer_free_bu=system_capacity - d.unprocessed_grain_bu,
                     current_dryer_rate_buph=d.current_dryer_rate_buph,
+                    candidate_moisture=c.moisture_for_harvest_position(len(field_order)),
                 )
             if choice is None:
                 raise AssertionError("Unfinished fields have no available task")
@@ -159,9 +167,7 @@ class Simulator:
             current = choice
             if combine_field != choice[0]:
                 combine_field = choice[0]
-                field = self.fields[combine_field]
-                d.set_field_context(field.field_id, field.one_way_travel_min)
-                field_order.append(field.field_id)
+                begin_field(combine_field)
 
             field = self.fields[current[0]]
             capacity = self.capacity(field, current[1])
@@ -191,9 +197,16 @@ class Simulator:
         if harvest_completion_h is None:
             raise AssertionError("Missing harvest completion time")
         mass_error = generated_bu - d.total_dried_bu - d.unprocessed_grain_bu
+        field_by_id = {field.field_id: field for field in self.fields}
         metrics: dict[str, float | int | str] = {
             "policy": self.controller.name,
             "field_order": " -> ".join(field_order),
+            "dryer_rate_order": " -> ".join(
+                f"{field_id}:{c.dryer_high_moisture_rate_buph:g}"
+                if field_by_id[field_id].moisture == "High"
+                else f"{field_id}:{c.dryer_low_moisture_rate_buph:g}"
+                for field_id in field_order
+            ),
             "grain_leg_rate_buph": c.grain_leg_rate_buph,
             "wet_bin_capacity_bu": c.wet_bin_capacity_bu,
             "dryer_high_moisture_rate_buph": c.dryer_high_moisture_rate_buph,
@@ -219,6 +232,8 @@ class Simulator:
             "total_dried_grain_bu": d.total_dried_bu,
             "total_dried_high_moisture_bu": d.dried_by_moisture_bu["High"],
             "total_dried_low_moisture_bu": d.dried_by_moisture_bu["Low"],
+            "total_dried_first_two_fields_bu": d.dried_by_moisture_bu["High"],
+            "total_dried_remaining_fields_bu": d.dried_by_moisture_bu["Low"],
             "dried_at_harvest_completion_bu": harvest_end_inventory["cumulative_grain_dried_bu"],
             "combine_tank_at_harvest_completion_bu": harvest_end_inventory["combine_tank_bu"],
             "semi_at_field_grain_at_harvest_completion_bu": harvest_end_inventory["semi_at_field_grain_bu"],

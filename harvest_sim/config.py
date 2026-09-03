@@ -11,17 +11,16 @@ class FieldSpec:
     field_id: str
     area_ac: float
     geometry: str
-    moisture: str
     one_way_travel_min: float
 
 
 DEFAULT_FIELDS = (
-    FieldSpec("F1", 50.0, "irregular", HIGH, 5.0),
-    FieldSpec("F2", 80.0, "rectangular", HIGH, 15.0),
-    FieldSpec("F3", 50.0, "irregular", LOW, 20.0),
-    FieldSpec("F4", 80.0, "rectangular", LOW, 5.0),
-    FieldSpec("F5", 50.0, "irregular", LOW, 15.0),
-    FieldSpec("F6", 80.0, "rectangular", LOW, 20.0),
+    FieldSpec("F1", 50.0, "irregular", 5.0),
+    FieldSpec("F2", 80.0, "rectangular", 15.0),
+    FieldSpec("F3", 50.0, "irregular", 20.0),
+    FieldSpec("F4", 80.0, "rectangular", 5.0),
+    FieldSpec("F5", 50.0, "irregular", 15.0),
+    FieldSpec("F6", 80.0, "rectangular", 20.0),
 )
 
 
@@ -49,6 +48,7 @@ class SimulationConfig:
     wet_bin_capacity_bu: float = 10000.0
     dryer_high_moisture_rate_buph: float = 500.0
     dryer_low_moisture_rate_buph: float = 800.0
+    high_moisture_fields_by_order: int = 2
 
     dt_h: float = 1.0 / 60.0
     switch_time_h: float = 20.0 / 60.0
@@ -76,6 +76,10 @@ class SimulationConfig:
             raise ValueError("switch_time_h must be finite and nonnegative")
         if not isinstance(self.semi_count, int) or isinstance(self.semi_count, bool) or self.semi_count < 1:
             raise ValueError("semi_count must be a positive integer")
+        if (not isinstance(self.high_moisture_fields_by_order, int)
+                or isinstance(self.high_moisture_fields_by_order, bool)
+                or not 0 <= self.high_moisture_fields_by_order <= len(self.field_specs)):
+            raise ValueError("high_moisture_fields_by_order must be between zero and field count")
         if self.receiving_pit_capacity_bu + self.numerical_tolerance < self.semi_capacity_bu:
             raise ValueError("receiving pit must hold at least one full semi")
         if not 0 <= self.low_receiving_pressure_fraction < self.high_receiving_pressure_fraction <= 1:
@@ -86,8 +90,6 @@ class SimulationConfig:
         for field in self.field_specs:
             if field.geometry not in ("rectangular", "irregular"):
                 raise ValueError("Field geometry must be rectangular or irregular")
-            if field.moisture not in (HIGH, LOW):
-                raise ValueError("Field moisture must be High or Low")
             if not isfinite(field.area_ac) or field.area_ac < self.opening_area_ac:
                 raise ValueError("Each field area must be at least the opening area")
             if not isfinite(field.one_way_travel_min) or field.one_way_travel_min < 0:
@@ -100,3 +102,7 @@ class SimulationConfig:
     @property
     def total_grain_bu(self) -> float:
         return self.total_area_ac * self.yield_bu_per_ac
+
+    def moisture_for_harvest_position(self, zero_based_position: int) -> str:
+        """Assign dryer class by actual field order, never by field ID."""
+        return HIGH if zero_based_position < self.high_moisture_fields_by_order else LOW

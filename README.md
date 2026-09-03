@@ -38,16 +38,18 @@ python3 run_baseline.py --policy adaptive \
 
 表中的运输时间是单程分钟，不是英里。返程时间与去程相同。
 
-| Field | Area (ac) | Geometry | Moisture | One-way transport (min) |
-| --- | ---: | --- | --- | ---: |
-| F1 | 50 | irregular | High | 5 |
-| F2 | 80 | rectangular | High | 15 |
-| F3 | 50 | irregular | Low | 20 |
-| F4 | 80 | rectangular | Low | 5 |
-| F5 | 50 | irregular | Low | 15 |
-| F6 | 80 | rectangular | Low | 20 |
+| Field | Area (ac) | Geometry | One-way transport (min) |
+| --- | ---: | --- | ---: |
+| F1 | 50 | irregular | 5 |
+| F2 | 80 | rectangular | 15 |
+| F3 | 50 | irregular | 20 |
+| F4 | 80 | rectangular | 5 |
+| F5 | 50 | irregular | 15 |
+| F6 | 80 | rectangular | 20 |
 
 总面积为 390 ac；按 200 bu/ac 计算，总粮量为 78,000 bu。每块田先完成 10 ac Opening，再完成剩余面积的 InteriorHarvest。开始一块田以后，必须完成该田两个阶段才能换到下一块田；换田耗时 20 分钟。因此六块田固定产生五次换田，共 100 分钟。
+
+Moisture 不绑定 F1–F6：实际收割顺序中的第 1、2 块田分配 High/500 bu/h，第 3–6 块田分配 Low/800 bu/h。Adaptive 改变田块顺序时，这两个档位也随顺序重新分配。
 
 ## 收割能力
 
@@ -70,8 +72,8 @@ Opening 速度保持独立，修改 interior 速度不会按比例重新缩放 O
 | Receiving pit | 1000 bu | 一车容量的站内接收坑 |
 | Grain leg | 3000 bu/h | 从接收坑送入 wet bin 的最大速度 |
 | Wet bin | 10000 bu | dryer 之前的湿粮仓容量 |
-| High-moisture dryer | 500 bu/h | F1、F2 的烘干速度 |
-| Low-moisture dryer | 800 bu/h | F3、F4、F5、F6 的烘干速度 |
+| First two fields dryer | 500 bu/h | 实际收割顺序的第 1、2 块田 |
+| Remaining fields dryer | 800 bu/h | 实际收割顺序的第 3–6 块田 |
 
 半挂车完整周期是：
 
@@ -87,7 +89,7 @@ Opening 速度保持独立，修改 interior 速度不会按比例重新缩放 O
 combine tank -> semi -> receiving pit -> grain leg -> wet bin -> dryer
 ```
 
-半挂车到站后，只有接收坑能够容纳整车粮食时才能开始固定 10 分钟卸货。Grain leg 是 wet bin 的输入设备，以最高 3000 bu/h 连续搬运。Dryer 按 wet bin 中粮食的先入先出顺序运行：队首为 High 时 500 bu/h，队首为 Low 时 800 bu/h。水分顺序不需要预先指定，速度由当前队首粮食自动决定。
+半挂车到站后，只有接收坑能够容纳整车粮食时才能开始固定 10 分钟卸货。Grain leg 是 wet bin 的输入设备，以最高 3000 bu/h 连续搬运。每块田开始时按照它在实际收割顺序中的位置分配 500 或 800 档；粮食进入 wet bin 后仍按先入先出顺序烘干，速度由队首粮食所属的顺序档位决定。
 
 Wet bin 满时，grain leg 最多只能补入 dryer 同时排出的数量；接收坑随后可能装满，半挂车会在粮站等待，田间失去可用车辆后，combine tank 满载并进入 `BLOCKED`。因此 wet bin 和 dryer 会真实地向上游产生回压，而不是无限库存。
 
@@ -100,7 +102,7 @@ Adaptive 只在一整块田完成后重新决策。每个候选田都预测到�
 - Opening 与 Interior 的生产时间和产粮量；
 - 该田的“去程 + 10 分钟卸货 + 返程”运输吞吐；
 - 当前可用的 combine/semi、接收坑和 wet bin 剩余空间；
-- 当前队首粮食及候选田水分对应的 dryer 能力；
+- 当前队首粮食，以及本次顺序位置对应的 dryer 能力；
 - 预计运输回压、dryer 回压和该田结束后留给后续田块的库存。
 
 预测得分最低的田先做。该计算是轻量确定性前瞻，而不是完整复制未来事件仿真；实际执行仍使用逐事件的物理模型。
@@ -129,4 +131,4 @@ harvested grain
 - `maximum_receiving_pit_inventory_bu` 和 `maximum_wet_bin_inventory_bu`：容量约束检查；
 - `mass_balance_error_bu`：最终粮食守恒误差。
 
-自动测试覆盖三种运输周期、10 分钟卸货、grain leg 速度、湿粮仓回压、High/Low FIFO dryer 切换、整田约束、自适应前瞻、逐时刻粮食守恒和所有容量上限。
+自动测试覆盖三种运输周期、10 分钟卸货、grain leg 速度、湿粮仓回压、按实际田块顺序分配 dryer 档位、FIFO 切换、整田约束、自适应前瞻、逐时刻粮食守恒和所有容量上限。

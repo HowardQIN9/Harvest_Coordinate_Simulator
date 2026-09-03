@@ -11,15 +11,15 @@ INTERIOR = "InteriorHarvest"
 class Field:
     field_id: str
     geometry: str
-    moisture: str
     one_way_travel_min: float
     total_area_ac: float
     opening_remaining_ac: float
     interior_remaining_ac: float
+    moisture: str = ""
 
     @classmethod
     def create(cls, spec: FieldSpec, config: SimulationConfig) -> "Field":
-        return cls(spec.field_id, spec.geometry, spec.moisture, spec.one_way_travel_min,
+        return cls(spec.field_id, spec.geometry, spec.one_way_travel_min,
                    spec.area_ac, config.opening_area_ac,
                    spec.area_ac - config.opening_area_ac)
 

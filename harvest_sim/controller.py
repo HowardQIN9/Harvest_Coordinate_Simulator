@@ -37,6 +37,7 @@ class AdaptiveController:
         field_mobile_free_bu: float = 0.0,
         system_buffer_free_bu: float = 0.0,
         current_dryer_rate_buph: float = 0.0,
+        candidate_moisture: str = "Low",
         **_: float,
     ) -> TaskRef | None:
         feasible = [(i, task) for i, field in enumerate(fields) for task in field.available_tasks()]
@@ -67,7 +68,7 @@ class AdaptiveController:
             unload_dock_rate = c.semi_capacity_bu / c.semi_unload_time_h
             transport_rate = min(truck_rate, unload_dock_rate, c.grain_leg_rate_buph)
             dryer_rate = (c.dryer_high_moisture_rate_buph
-                          if field.moisture == "High"
+                          if candidate_moisture == "High"
                           else c.dryer_low_moisture_rate_buph)
             active_dryer_rate = current_dryer_rate_buph or dryer_rate
 

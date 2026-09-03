@@ -101,15 +101,15 @@ class SimulatorTests(unittest.TestCase):
 
     def test_default_field_table(self):
         c = SimulationConfig()
-        actual = [(f.field_id, f.area_ac, f.geometry, f.moisture,
+        actual = [(f.field_id, f.area_ac, f.geometry,
                    f.one_way_travel_min) for f in c.field_specs]
         self.assertEqual(actual, [
-            ("F1", 50.0, "irregular", HIGH, 5.0),
-            ("F2", 80.0, "rectangular", HIGH, 15.0),
-            ("F3", 50.0, "irregular", LOW, 20.0),
-            ("F4", 80.0, "rectangular", LOW, 5.0),
-            ("F5", 50.0, "irregular", LOW, 15.0),
-            ("F6", 80.0, "rectangular", LOW, 20.0),
+            ("F1", 50.0, "irregular", 5.0),
+            ("F2", 80.0, "rectangular", 15.0),
+            ("F3", 50.0, "irregular", 20.0),
+            ("F4", 80.0, "rectangular", 5.0),
+            ("F5", 50.0, "irregular", 15.0),
+            ("F6", 80.0, "rectangular", 20.0),
         ])
         self.assertEqual(c.total_area_ac, 390.0)
         self.assertEqual(c.total_grain_bu, 78000.0)
@@ -123,10 +123,18 @@ class SimulatorTests(unittest.TestCase):
                 self.assertAlmostEqual(metrics["total_harvested_ac"], 390.0)
                 self.assertAlmostEqual(metrics["total_dried_grain_bu"], 78000.0,
                                        places=5)
+                order = metrics["field_order"].split(" -> ")
+                area_by_id = {field.field_id: field.area_ac for field in c.field_specs}
+                expected_high = sum(area_by_id[field_id] for field_id in order[:2]) * c.yield_bu_per_ac
                 self.assertAlmostEqual(metrics["total_dried_high_moisture_bu"],
-                                       26000.0, places=5)
+                                       expected_high, places=5)
                 self.assertAlmostEqual(metrics["total_dried_low_moisture_bu"],
-                                       52000.0, places=5)
+                                       c.total_grain_bu - expected_high, places=5)
+                field_by_id = {field.field_id: field for field in result.fields}
+                self.assertTrue(all(field_by_id[field_id].moisture == HIGH
+                                    for field_id in order[:2]))
+                self.assertTrue(all(field_by_id[field_id].moisture == LOW
+                                    for field_id in order[2:]))
                 accounted = (metrics["productive_harvest_time_h"]
                              + metrics["blocked_time_h"]
                              + metrics["switching_time_h"])
@@ -193,8 +201,9 @@ class SimulatorTests(unittest.TestCase):
             {"grain_leg_rate_buph": 0.0},
             {"wet_bin_capacity_bu": -1.0},
             {"receiving_pit_capacity_bu": 999.0},
-            {"field_specs": (FieldSpec("F1", 5.0, "irregular", HIGH, 5.0),)},
-            {"field_specs": (FieldSpec("F1", 50.0, "round", HIGH, 5.0),)},
+            {"field_specs": (FieldSpec("F1", 5.0, "irregular", 5.0),)},
+            {"field_specs": (FieldSpec("F1", 50.0, "round", 5.0),)},
+            {"high_moisture_fields_by_order": 7},
         ]
         for values in cases:
             with self.subTest(values=values), self.assertRaises(ValueError):

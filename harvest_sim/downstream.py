@@ -310,6 +310,8 @@ class Downstream:
             "wet_bin_inventory_bu": self.wet_bin_inventory_bu,
             "wet_bin_high_moisture_bu": sum(lot.amount_bu for lot in self.wet_bin_lots if lot.moisture == HIGH),
             "wet_bin_low_moisture_bu": sum(lot.amount_bu for lot in self.wet_bin_lots if lot.moisture != HIGH),
+            "wet_bin_first_two_fields_bu": sum(lot.amount_bu for lot in self.wet_bin_lots if lot.moisture == HIGH),
+            "wet_bin_remaining_fields_bu": sum(lot.amount_bu for lot in self.wet_bin_lots if lot.moisture != HIGH),
             "dryer_rate_buph": self.current_dryer_rate_buph,
             "semis_at_field": sum(semi.state == AT_FIELD for semi in self.semis),
             "semis_waiting_at_gc": sum(semi.state == WAITING_UNLOAD for semi in self.semis),
@@ -319,6 +321,8 @@ class Downstream:
             "cumulative_grain_dried_bu": self.total_dried_bu,
             "cumulative_dried_high_bu": self.dried_by_moisture_bu[HIGH],
             "cumulative_dried_low_bu": self.dried_by_moisture_bu[LOW],
+            "cumulative_dried_first_two_fields_bu": self.dried_by_moisture_bu[HIGH],
+            "cumulative_dried_remaining_fields_bu": self.dried_by_moisture_bu[LOW],
             # Compatibility aliases for older output consumers.
             "grain_center_inventory_bu": self.wet_bin_inventory_bu,
             "cumulative_grain_received_bu": self.total_unloaded_bu,
