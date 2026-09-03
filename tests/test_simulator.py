@@ -2,7 +2,7 @@ import unittest
 from dataclasses import replace
 
 from harvest_sim import SimulationConfig, Simulator
-from harvest_sim.config import FieldSpec, HIGH, LOW
+from harvest_sim.config import FieldSpec
 from harvest_sim.downstream import (
     AT_FIELD,
     RETURNING,
@@ -15,9 +15,10 @@ from harvest_sim.field import INTERIOR, OPENING
 
 
 class DownstreamTests(unittest.TestCase):
-    def full_departure(self, downstream: Downstream, moisture: str = HIGH) -> None:
+    def full_departure(self, downstream: Downstream,
+                       moisture_pct: float = 18.0) -> None:
         for _ in range(2):
-            downstream.add_harvested_grain(500.0, moisture, "F1")
+            downstream.add_harvested_grain(500.0, moisture_pct, "F1")
             downstream.unload_combine()
 
     def test_five_plus_ten_plus_five_minute_trip(self):
@@ -45,36 +46,36 @@ class DownstreamTests(unittest.TestCase):
 
     def test_grain_leg_feeds_wet_bin_at_3000_buph(self):
         d = Downstream(SimulationConfig())
-        d.receiving_pit_lots.append(GrainLot(1000.0, HIGH, "F1"))
+        d.receiving_pit_lots.append(GrainLot(1000.0, 18.0, "F1"))
         d.advance_time(10 / 60)
         self.assertAlmostEqual(d.total_leg_transferred_bu, 500.0)
-        self.assertAlmostEqual(d.total_dried_bu, 500.0 * 10 / 60)
-        self.assertAlmostEqual(d.wet_bin_inventory_bu, 500.0 - 500.0 * 10 / 60)
+        self.assertAlmostEqual(d.total_dried_bu, 800.0 * 10 / 60)
+        self.assertAlmostEqual(d.wet_bin_inventory_bu, 500.0 - 800.0 * 10 / 60)
 
     def test_fifo_dryer_changes_rate_with_moisture(self):
         d = Downstream(SimulationConfig())
         d.wet_bin_lots.extend([
-            GrainLot(100.0, HIGH, "F1"),
-            GrainLot(100.0, LOW, "F3"),
+            GrainLot(100.0, 18.0, "F1"),
+            GrainLot(100.0, 22.0, "F2"),
         ])
-        d.advance_time(0.2)
-        self.assertAlmostEqual(d.dried_by_moisture_bu[HIGH], 100.0)
-        self.assertAlmostEqual(d.dried_by_moisture_bu[LOW], 0.0)
-        self.assertEqual(d.current_dryer_rate_buph, 800.0)
         d.advance_time(0.125)
-        self.assertAlmostEqual(d.dried_by_moisture_bu[LOW], 100.0)
+        self.assertAlmostEqual(d.dried_by_field_bu["F1"], 100.0)
+        self.assertNotIn("F2", d.dried_by_field_bu)
+        self.assertEqual(d.current_dryer_rate_buph, 400.0)
+        d.advance_time(0.25)
+        self.assertAlmostEqual(d.dried_by_field_bu["F2"], 100.0)
         self.assertAlmostEqual(d.wet_bin_inventory_bu, 0.0)
 
     def test_full_downstream_makes_semi_wait(self):
         d = Downstream(SimulationConfig())
-        d.receiving_pit_lots.append(GrainLot(1000.0, HIGH, "F1"))
-        d.wet_bin_lots.append(GrainLot(10000.0, HIGH, "F1"))
+        d.receiving_pit_lots.append(GrainLot(1000.0, 22.0, "F1"))
+        d.wet_bin_lots.append(GrainLot(10000.0, 22.0, "F1"))
         semi = d.semis[0]
-        semi.lots.append(GrainLot(1000.0, HIGH, "F1"))
+        semi.lots.append(GrainLot(1000.0, 22.0, "F1"))
         semi.state = WAITING_UNLOAD
         d.handle_events()
         self.assertEqual(semi.state, WAITING_UNLOAD)
-        d.advance_time(2.0)
+        d.advance_time(2.5)
         d.handle_events()
         self.assertEqual(semi.state, UNLOADING)
         self.assertAlmostEqual(d.receiving_pit_inventory_bu, 0.0)
@@ -110,31 +111,38 @@ class SimulatorTests(unittest.TestCase):
             ("F4", 80.0, "rectangular", 5.0),
             ("F5", 50.0, "irregular", 15.0),
             ("F6", 80.0, "rectangular", 20.0),
+            ("F7", 50.0, "irregular", 15.0),
+            ("F8", 80.0, "rectangular", 15.0),
+            ("F9", 50.0, "irregular", 15.0),
+            ("F10", 80.0, "rectangular", 15.0),
         ])
-        self.assertEqual(c.total_area_ac, 390.0)
-        self.assertEqual(c.total_grain_bu, 78000.0)
+        added_fields = c.field_specs[6:]
+        self.assertEqual(sum(f.geometry == "rectangular" for f in added_fields), 2)
+        self.assertEqual(sum(f.geometry == "irregular" for f in added_fields), 2)
+        self.assertTrue(all(f.one_way_travel_min == 15.0 for f in added_fields))
+        self.assertEqual(c.total_area_ac, 650.0)
+        self.assertEqual(c.total_grain_bu, 130000.0)
 
     def test_both_policies_finish_with_conservation(self):
         c = SimulationConfig()
+        field_moistures = c.sample_field_moistures()
         for policy in ("sequential", "adaptive"):
             with self.subTest(policy=policy):
-                result = Simulator(c, policy).run()
+                result = Simulator(c, policy, field_moistures).run()
                 metrics = result.metrics
-                self.assertAlmostEqual(metrics["total_harvested_ac"], 390.0)
-                self.assertAlmostEqual(metrics["total_dried_grain_bu"], 78000.0,
+                self.assertAlmostEqual(metrics["total_harvested_ac"], 650.0)
+                self.assertAlmostEqual(metrics["total_dried_grain_bu"], 130000.0,
                                        places=5)
-                order = metrics["field_order"].split(" -> ")
-                area_by_id = {field.field_id: field.area_ac for field in c.field_specs}
-                expected_high = sum(area_by_id[field_id] for field_id in order[:2]) * c.yield_bu_per_ac
-                self.assertAlmostEqual(metrics["total_dried_high_moisture_bu"],
-                                       expected_high, places=5)
-                self.assertAlmostEqual(metrics["total_dried_low_moisture_bu"],
-                                       c.total_grain_bu - expected_high, places=5)
-                field_by_id = {field.field_id: field for field in result.fields}
-                self.assertTrue(all(field_by_id[field_id].moisture == HIGH
-                                    for field_id in order[:2]))
-                self.assertTrue(all(field_by_id[field_id].moisture == LOW
-                                    for field_id in order[2:]))
+                self.assertEqual(tuple(field.moisture_pct for field in result.fields),
+                                 field_moistures)
+                expected_average = sum(
+                    spec.area_ac * moisture
+                    for spec, moisture in zip(c.field_specs, field_moistures)
+                ) / c.total_area_ac
+                self.assertAlmostEqual(
+                    metrics["total_dried_average_moisture_pct"],
+                    expected_average,
+                )
                 accounted = (metrics["productive_harvest_time_h"]
                              + metrics["blocked_time_h"]
                              + metrics["switching_time_h"])
@@ -142,6 +150,22 @@ class SimulatorTests(unittest.TestCase):
                                        accounted, places=6)
                 self.assertAlmostEqual(metrics["mass_balance_error_bu"], 0.0)
                 self.assert_mass_balance(result, c)
+
+    def test_field_moisture_is_reproducible_and_policy_independent(self):
+        c = SimulationConfig(random_seed=42)
+        self.assertEqual(c.dryer_rate_for_moisture(18.0), 800.0)
+        self.assertEqual(c.dryer_rate_for_moisture(22.0), 400.0)
+        first = c.sample_field_moistures()
+        second = c.sample_field_moistures()
+        different_seed = replace(c, random_seed=43).sample_field_moistures()
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, different_seed)
+        self.assertTrue(all(c.moisture_min_pct <= value <= c.moisture_max_pct
+                            for value in first))
+        sequential = Simulator(c, "sequential", first)
+        adaptive = Simulator(c, "adaptive", first)
+        self.assertEqual(tuple(field.moisture_pct for field in sequential.fields),
+                         tuple(field.moisture_pct for field in adaptive.fields))
 
     def test_every_field_finishes_before_switch(self):
         result = Simulator(SimulationConfig(), "adaptive").run()
@@ -158,9 +182,9 @@ class SimulatorTests(unittest.TestCase):
             for field_id in field_order
             for phase in (OPENING, INTERIOR)
         ])
-        self.assertEqual(len(field_order), 6)
-        self.assertEqual(result.metrics["number_of_field_switches"], 5)
-        self.assertAlmostEqual(result.metrics["switching_time_h"], 100 / 60)
+        self.assertEqual(len(field_order), 10)
+        self.assertEqual(result.metrics["number_of_field_switches"], 9)
+        self.assertAlmostEqual(result.metrics["switching_time_h"], 180 / 60)
 
     def test_transport_event_times_use_each_field_minutes(self):
         result = Simulator(SimulationConfig(), "sequential").run()
@@ -203,7 +227,9 @@ class SimulatorTests(unittest.TestCase):
             {"receiving_pit_capacity_bu": 999.0},
             {"field_specs": (FieldSpec("F1", 5.0, "irregular", 5.0),)},
             {"field_specs": (FieldSpec("F1", 50.0, "round", 5.0),)},
-            {"high_moisture_fields_by_order": 7},
+            {"random_seed": True},
+            {"moisture_min_pct": 22.0},
+            {"dryer_intercept_buph": 2200.0},
         ]
         for values in cases:
             with self.subTest(values=values), self.assertRaises(ValueError):

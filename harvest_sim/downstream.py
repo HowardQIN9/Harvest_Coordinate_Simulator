@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from math import inf
 from typing import Any
 
-from .config import HIGH, LOW, SimulationConfig
+from .config import SimulationConfig
 
 AT_FIELD = "AT_FIELD"
 TO_GC = "TO_GC"
@@ -16,7 +16,7 @@ RETURNING = "RETURNING"
 @dataclass
 class GrainLot:
     amount_bu: float
-    moisture: str
+    moisture_pct: float
     field_id: str
 
 
@@ -37,13 +37,15 @@ class Semi:
         return sum(lot.amount_bu for lot in self.lots)
 
 
-def _append_lot(queue: list[GrainLot], amount_bu: float, moisture: str, field_id: str) -> None:
+def _append_lot(queue: list[GrainLot], amount_bu: float,
+                moisture_pct: float, field_id: str) -> None:
     if amount_bu <= 1e-12:
         return
-    if queue and queue[-1].moisture == moisture and queue[-1].field_id == field_id:
+    if (queue and queue[-1].moisture_pct == moisture_pct
+            and queue[-1].field_id == field_id):
         queue[-1].amount_bu += amount_bu
     else:
-        queue.append(GrainLot(amount_bu, moisture, field_id))
+        queue.append(GrainLot(amount_bu, moisture_pct, field_id))
 
 
 def _move_lots(source: list[GrainLot], destination: list[GrainLot], amount_bu: float) -> list[GrainLot]:
@@ -52,8 +54,8 @@ def _move_lots(source: list[GrainLot], destination: list[GrainLot], amount_bu: f
     while remaining > 1e-10 and source:
         take = min(remaining, source[0].amount_bu)
         lot = source[0]
-        _append_lot(destination, take, lot.moisture, lot.field_id)
-        _append_lot(moved, take, lot.moisture, lot.field_id)
+        _append_lot(destination, take, lot.moisture_pct, lot.field_id)
+        _append_lot(moved, take, lot.moisture_pct, lot.field_id)
         lot.amount_bu -= take
         remaining -= take
         if lot.amount_bu <= 1e-9:
@@ -77,7 +79,8 @@ class Downstream:
         self.total_unloaded_bu = 0.0
         self.total_leg_transferred_bu = 0.0
         self.total_dried_bu = 0.0
-        self.dried_by_moisture_bu = {HIGH: 0.0, LOW: 0.0}
+        self.total_dried_moisture_bushel_pct = 0.0
+        self.dried_by_field_bu: dict[str, float] = {}
         self.events: list[dict[str, Any]] = []
 
     @property
@@ -123,9 +126,7 @@ class Downstream:
         queue = self.wet_bin_lots or self.receiving_pit_lots
         if not queue:
             return 0.0
-        return (self.config.dryer_high_moisture_rate_buph
-                if queue[0].moisture == HIGH
-                else self.config.dryer_low_moisture_rate_buph)
+        return self.config.dryer_rate_for_moisture(queue[0].moisture_pct)
 
     @property
     def next_event_h(self) -> float:
@@ -138,12 +139,12 @@ class Downstream:
         self.current_field_id = field_id
         self.current_travel_h = one_way_travel_min / 60.0
 
-    def add_harvested_grain(self, grain_bu: float, moisture: str, field_id: str) -> None:
-        _append_lot(self.combine_lots, grain_bu, moisture, field_id)
+    def add_harvested_grain(self, grain_bu: float,
+                            moisture_pct: float, field_id: str) -> None:
+        _append_lot(self.combine_lots, grain_bu, moisture_pct, field_id)
 
-    def _dryer_rate(self, moisture: str) -> float:
-        return (self.config.dryer_high_moisture_rate_buph
-                if moisture == HIGH else self.config.dryer_low_moisture_rate_buph)
+    def _dryer_rate(self, moisture_pct: float) -> float:
+        return self.config.dryer_rate_for_moisture(moisture_pct)
 
     def _dry(self, amount_bu: float) -> None:
         if amount_bu <= self.config.numerical_tolerance:
@@ -151,7 +152,9 @@ class Downstream:
         dried_lots: list[GrainLot] = []
         _move_lots(self.wet_bin_lots, dried_lots, amount_bu)
         for lot in dried_lots:
-            self.dried_by_moisture_bu[lot.moisture] += lot.amount_bu
+            self.total_dried_moisture_bushel_pct += lot.amount_bu * lot.moisture_pct
+            self.dried_by_field_bu[lot.field_id] = (
+                self.dried_by_field_bu.get(lot.field_id, 0.0) + lot.amount_bu)
 
     def advance_time(self, duration_h: float) -> None:
         c = self.config
@@ -166,7 +169,7 @@ class Downstream:
             pit = self.receiving_pit_inventory_bu
             wet = self.wet_bin_inventory_bu
             head_queue = self.wet_bin_lots or self.receiving_pit_lots
-            dryer_rate = self._dryer_rate(head_queue[0].moisture) if head_queue else 0.0
+            dryer_rate = self._dryer_rate(head_queue[0].moisture_pct) if head_queue else 0.0
 
             if pit <= c.numerical_tolerance:
                 leg_rate = 0.0
@@ -210,8 +213,8 @@ class Downstream:
         self.time_h += duration_h
 
     def _moisture_label(self, lots: list[GrainLot]) -> str:
-        values = sorted({lot.moisture for lot in lots})
-        return "+".join(values)
+        values = sorted({lot.moisture_pct for lot in lots})
+        return "+".join(f"{value:.4f}" for value in values)
 
     def _field_label(self, lots: list[GrainLot]) -> str:
         values = []
@@ -226,7 +229,7 @@ class Downstream:
         self.events.append({
             "time_h": self.time_h, "event": kind, "semi_id": semi.semi_id,
             "grain_bu": grain_bu, "trip": semi.trips,
-            "moisture": self._moisture_label(event_lots),
+            "moisture_pct": self._moisture_label(event_lots),
             "grain_field_ids": self._field_label(event_lots),
             "route_field_id": semi.route_field_id,
             "one_way_travel_min": semi.route_travel_h * 60.0,
@@ -265,7 +268,8 @@ class Downstream:
         for semi in self.semis:
             if semi.state == UNLOADING and semi.unload_complete_h <= self.time_h + tolerance:
                 grain = semi.load_bu
-                lots = [GrainLot(lot.amount_bu, lot.moisture, lot.field_id) for lot in semi.lots]
+                lots = [GrainLot(lot.amount_bu, lot.moisture_pct, lot.field_id)
+                        for lot in semi.lots]
                 _move_lots(semi.lots, self.receiving_pit_lots, grain)
                 self.total_unloaded_bu += grain
                 self._event("FINISH_UNLOAD", semi, grain, lots)
@@ -299,7 +303,14 @@ class Downstream:
             if semi.state == AT_FIELD and semi.load_bu > self.config.numerical_tolerance:
                 self._depart(semi)
 
+    def _weighted_moisture_pct(self, lots: list[GrainLot]) -> float:
+        total_bu = sum(lot.amount_bu for lot in lots)
+        if total_bu <= self.config.numerical_tolerance:
+            return 0.0
+        return sum(lot.amount_bu * lot.moisture_pct for lot in lots) / total_bu
+
     def snapshot(self) -> dict[str, Any]:
+        dryer_queue = self.wet_bin_lots or self.receiving_pit_lots
         row: dict[str, Any] = {
             "combine_tank_bu": self.combine_tank_bu,
             "semi_at_field_grain_bu": self.semi_at_field_grain_bu,
@@ -308,10 +319,12 @@ class Downstream:
             "semi_at_gc_grain_bu": self.semi_at_gc_grain_bu,
             "receiving_pit_inventory_bu": self.receiving_pit_inventory_bu,
             "wet_bin_inventory_bu": self.wet_bin_inventory_bu,
-            "wet_bin_high_moisture_bu": sum(lot.amount_bu for lot in self.wet_bin_lots if lot.moisture == HIGH),
-            "wet_bin_low_moisture_bu": sum(lot.amount_bu for lot in self.wet_bin_lots if lot.moisture != HIGH),
-            "wet_bin_first_two_fields_bu": sum(lot.amount_bu for lot in self.wet_bin_lots if lot.moisture == HIGH),
-            "wet_bin_remaining_fields_bu": sum(lot.amount_bu for lot in self.wet_bin_lots if lot.moisture != HIGH),
+            "wet_bin_head_moisture_pct": (self.wet_bin_lots[0].moisture_pct
+                                           if self.wet_bin_lots else 0.0),
+            "wet_bin_average_moisture_pct": self._weighted_moisture_pct(
+                self.wet_bin_lots),
+            "dryer_head_moisture_pct": (dryer_queue[0].moisture_pct
+                                          if dryer_queue else 0.0),
             "dryer_rate_buph": self.current_dryer_rate_buph,
             "semis_at_field": sum(semi.state == AT_FIELD for semi in self.semis),
             "semis_waiting_at_gc": sum(semi.state == WAITING_UNLOAD for semi in self.semis),
@@ -319,10 +332,9 @@ class Downstream:
             "cumulative_grain_unloaded_bu": self.total_unloaded_bu,
             "cumulative_grain_to_wet_bin_bu": self.total_leg_transferred_bu,
             "cumulative_grain_dried_bu": self.total_dried_bu,
-            "cumulative_dried_high_bu": self.dried_by_moisture_bu[HIGH],
-            "cumulative_dried_low_bu": self.dried_by_moisture_bu[LOW],
-            "cumulative_dried_first_two_fields_bu": self.dried_by_moisture_bu[HIGH],
-            "cumulative_dried_remaining_fields_bu": self.dried_by_moisture_bu[LOW],
+            "cumulative_dried_average_moisture_pct": (
+                self.total_dried_moisture_bushel_pct / self.total_dried_bu
+                if self.total_dried_bu > self.config.numerical_tolerance else 0.0),
             # Compatibility aliases for older output consumers.
             "grain_center_inventory_bu": self.wet_bin_inventory_bu,
             "cumulative_grain_received_bu": self.total_unloaded_bu,

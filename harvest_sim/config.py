@@ -1,9 +1,7 @@
 from dataclasses import dataclass
 from math import isfinite
+from random import Random
 
-
-HIGH = "High"
-LOW = "Low"
 
 
 @dataclass(frozen=True)
@@ -21,6 +19,10 @@ DEFAULT_FIELDS = (
     FieldSpec("F4", 80.0, "rectangular", 5.0),
     FieldSpec("F5", 50.0, "irregular", 15.0),
     FieldSpec("F6", 80.0, "rectangular", 20.0),
+    FieldSpec("F7", 50.0, "irregular", 15.0),
+    FieldSpec("F8", 80.0, "rectangular", 15.0),
+    FieldSpec("F9", 50.0, "irregular", 15.0),
+    FieldSpec("F10", 80.0, "rectangular", 15.0),
 )
 
 
@@ -46,9 +48,13 @@ class SimulationConfig:
     receiving_pit_capacity_bu: float = 1000.0
     grain_leg_rate_buph: float = 3000.0
     wet_bin_capacity_bu: float = 10000.0
-    dryer_high_moisture_rate_buph: float = 500.0
-    dryer_low_moisture_rate_buph: float = 800.0
-    high_moisture_fields_by_order: int = 2
+
+    # Moisture is sampled once per field, then remains fixed for the scenario.
+    random_seed: int = 42
+    moisture_min_pct: float = 18.0
+    moisture_max_pct: float = 22.0
+    dryer_intercept_buph: float = 2600.0
+    dryer_moisture_slope_buph_per_pct: float = 100.0
 
     dt_h: float = 1.0 / 60.0
     switch_time_h: float = 20.0 / 60.0
@@ -63,7 +69,7 @@ class SimulationConfig:
             "irregular_opening_capacity_acph", "yield_bu_per_ac", "dt_h",
             "combine_tank_capacity_bu", "semi_capacity_bu", "semi_unload_time_h",
             "receiving_pit_capacity_bu", "grain_leg_rate_buph", "wet_bin_capacity_bu",
-            "dryer_high_moisture_rate_buph", "dryer_low_moisture_rate_buph",
+            "dryer_intercept_buph", "dryer_moisture_slope_buph_per_pct",
             "numerical_tolerance", "max_simulation_h",
         )
         for name in positive:
@@ -76,10 +82,14 @@ class SimulationConfig:
             raise ValueError("switch_time_h must be finite and nonnegative")
         if not isinstance(self.semi_count, int) or isinstance(self.semi_count, bool) or self.semi_count < 1:
             raise ValueError("semi_count must be a positive integer")
-        if (not isinstance(self.high_moisture_fields_by_order, int)
-                or isinstance(self.high_moisture_fields_by_order, bool)
-                or not 0 <= self.high_moisture_fields_by_order <= len(self.field_specs)):
-            raise ValueError("high_moisture_fields_by_order must be between zero and field count")
+        if not isinstance(self.random_seed, int) or isinstance(self.random_seed, bool):
+            raise ValueError("random_seed must be an integer")
+        if (not isfinite(self.moisture_min_pct)
+                or not isfinite(self.moisture_max_pct)
+                or self.moisture_min_pct >= self.moisture_max_pct):
+            raise ValueError("moisture bounds must be finite and satisfy min < max")
+        if self.dryer_rate_for_moisture(self.moisture_max_pct) <= 0:
+            raise ValueError("dryer throughput must remain positive over the moisture range")
         if self.receiving_pit_capacity_bu + self.numerical_tolerance < self.semi_capacity_bu:
             raise ValueError("receiving pit must hold at least one full semi")
         if not 0 <= self.low_receiving_pressure_fraction < self.high_receiving_pressure_fraction <= 1:
@@ -103,6 +113,13 @@ class SimulationConfig:
     def total_grain_bu(self) -> float:
         return self.total_area_ac * self.yield_bu_per_ac
 
-    def moisture_for_harvest_position(self, zero_based_position: int) -> str:
-        """Assign dryer class by actual field order, never by field ID."""
-        return HIGH if zero_based_position < self.high_moisture_fields_by_order else LOW
+    def sample_field_moistures(self) -> tuple[float, ...]:
+        """Return one reproducible U(min, max) moisture draw per field."""
+        rng = Random(self.random_seed)
+        return tuple(rng.uniform(self.moisture_min_pct, self.moisture_max_pct)
+                     for _ in self.field_specs)
+
+    def dryer_rate_for_moisture(self, moisture_pct: float) -> float:
+        """Linear calibration: D(M) = intercept - slope * M."""
+        return (self.dryer_intercept_buph
+                - self.dryer_moisture_slope_buph_per_pct * moisture_pct)

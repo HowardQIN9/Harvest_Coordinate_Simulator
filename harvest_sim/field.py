@@ -15,13 +15,14 @@ class Field:
     total_area_ac: float
     opening_remaining_ac: float
     interior_remaining_ac: float
-    moisture: str = ""
+    moisture_pct: float
 
     @classmethod
-    def create(cls, spec: FieldSpec, config: SimulationConfig) -> "Field":
+    def create(cls, spec: FieldSpec, config: SimulationConfig,
+               moisture_pct: float) -> "Field":
         return cls(spec.field_id, spec.geometry, spec.one_way_travel_min,
                    spec.area_ac, config.opening_area_ac,
-                   spec.area_ac - config.opening_area_ac)
+                   spec.area_ac - config.opening_area_ac, moisture_pct)
 
     @property
     def opening_complete(self) -> bool:

@@ -28,8 +28,9 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
         '.tick {font-size:20pt;fill:#64748b} .main-title {font-size:28pt;font-weight:bold}</style>',
         f'<text class="main-title" x="{left}" y="42">Harvest / transport / wet-bin simulation — {escape(result.policy)}</text>',
         f'<text x="{left}" y="82">Wet bin {config.wet_bin_capacity_bu:g} bu | Grain leg {config.grain_leg_rate_buph:g} bu/h | '
-        f'Dryer first 2 fields {config.dryer_high_moisture_rate_buph:g}, remaining fields {config.dryer_low_moisture_rate_buph:g} bu/h</text>',
-        f'<text x="{left}" y="118">Trips use 5, 15, or 20 min outbound + {config.semi_unload_time_h * 60:g} min unload + equal return time</text>',
+        f'Dryer D(M) = {config.dryer_intercept_buph:g} - {config.dryer_moisture_slope_buph_per_pct:g}M bu/h</text>',
+        f'<text x="{left}" y="118">Field moisture U({config.moisture_min_pct:g}%, {config.moisture_max_pct:g}%), seed {config.random_seed} | '
+        f'Trips use 5, 15, or 20 min outbound + {config.semi_unload_time_h * 60:g} min unload + equal return time</text>',
     ]
 
     def x(time_h: float) -> float:
@@ -127,13 +128,9 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
 
     panel(4, "Wet bin (bu)", config.wet_bin_capacity_bu)
     line(4, "wet_bin_inventory_bu", config.wet_bin_capacity_bu, "#0891b2", 3.0)
-    line(4, "wet_bin_first_two_fields_bu", config.wet_bin_capacity_bu, "#dc2626")
-    line(4, "wet_bin_remaining_fields_bu", config.wet_bin_capacity_bu, "#16a34a")
-    legend(4, [("Total wet bin", "#0891b2"), ("Order 1-2: 500", "#dc2626"),
-               ("Order 3-6: 800", "#16a34a")])
+    legend(4, [("FIFO wet-bin inventory", "#0891b2")])
 
-    dryer_max = max(config.dryer_high_moisture_rate_buph,
-                    config.dryer_low_moisture_rate_buph)
+    dryer_max = config.dryer_rate_for_moisture(config.moisture_min_pct)
     panel(5, "Dryer rate (bu/h)", dryer_max)
     line(5, "dryer_rate_buph", dryer_max, "#9333ea")
     legend(5, [("Active dryer rate", "#9333ea")])

@@ -13,13 +13,17 @@ python3 run_experiments.py
 python3 -m unittest discover -s tests -v
 ```
 
-只使用 Python 标准库。默认结果写入 `results/wetbin_dryer/`：
+只使用 Python 标准库。默认结果写入 `results/current/fields10_seed42_moisture18-22_wetbin10000_leg3000/`，并按 `sequential/` 和 `adaptive/` 分目录：
 
-- `*_metrics.json`：汇总指标；
-- `*_timeseries.csv`：每个时间步和事件边界的库存与状态；
-- `*_transport_events.csv`：装车、出发、到站、开始/完成卸货和返田事件；
-- `*_plots_20pt.svg`：完整仿真图；
-- `*_first3h_20pt.svg`：前三小时细节图。
+- `metrics.json`：汇总指标；
+- `timeseries.csv`：每个时间步和事件边界的库存与状态；
+- `transport_events.csv`：装车、出发、到站、开始/完成卸货和返田事件；
+- `overview.svg`：完整仿真图；
+- `first_3h.svg`：前三小时细节图；
+- `field_scenario.csv`：所有策略共用的田块面积、形状、距离、moisture 和 dryer rate；
+- `policy_comparison.csv`：两种策略的汇总对比。
+
+旧模型产生的结果保留在 `results/archive/`，目录说明见 `results/README.md`。
 
 所有图使用 20pt 字体，子图标题放在左侧竖排，并为标题、坐标和图例预留独立空间。
 
@@ -29,8 +33,11 @@ python3 -m unittest discover -s tests -v
 python3 run_baseline.py --policy adaptive \
   --wet-bin-capacity 10000 \
   --grain-leg-rate 3000 \
-  --dryer-high-rate 500 \
-  --dryer-low-rate 800 \
+  --seed 42 \
+  --moisture-min 18 \
+  --moisture-max 22 \
+  --dryer-intercept 2600 \
+  --dryer-slope 100 \
   --name-suffix trial
 ```
 
@@ -46,10 +53,14 @@ python3 run_baseline.py --policy adaptive \
 | F4 | 80 | rectangular | 5 |
 | F5 | 50 | irregular | 15 |
 | F6 | 80 | rectangular | 20 |
+| F7 | 50 | irregular | 15 |
+| F8 | 80 | rectangular | 15 |
+| F9 | 50 | irregular | 15 |
+| F10 | 80 | rectangular | 15 |
 
-总面积为 390 ac；按 200 bu/ac 计算，总粮量为 78,000 bu。每块田先完成 10 ac Opening，再完成剩余面积的 InteriorHarvest。开始一块田以后，必须完成该田两个阶段才能换到下一块田；换田耗时 20 分钟。因此六块田固定产生五次换田，共 100 分钟。
+总面积为 650 ac；按 200 bu/ac 计算，总粮量为 130,000 bu。新增的 F7–F10 中，两个为规则田、两个为不规则田，单程运输时间均为中间档 15 分钟。每块田先完成 10 ac Opening，再完成剩余面积的 InteriorHarvest。开始一块田以后，必须完成该田两个阶段才能换到下一块田；换田耗时 20 分钟。因此十块田固定产生九次换田，共 180 分钟。
 
-Moisture 不绑定 F1–F6：实际收割顺序中的第 1、2 块田分配 High/500 bu/h，第 3–6 块田分配 Low/800 bu/h。Adaptive 改变田块顺序时，这两个档位也随顺序重新分配。
+每个田块的 moisture 是场景参数。在 simulation 初始化时独立采样 `M_i ~ U(18%, 22%)`，默认固定 `seed=42`。一旦生成，`M_i` 在整个 simulation 中保持不变；Sequential 和 Adaptive 显式共用同一组 moisture realization。
 
 ## 收割能力
 
@@ -72,8 +83,8 @@ Opening 速度保持独立，修改 interior 速度不会按比例重新缩放 O
 | Receiving pit | 1000 bu | 一车容量的站内接收坑 |
 | Grain leg | 3000 bu/h | 从接收坑送入 wet bin 的最大速度 |
 | Wet bin | 10000 bu | dryer 之前的湿粮仓容量 |
-| First two fields dryer | 500 bu/h | 实际收割顺序的第 1、2 块田 |
-| Remaining fields dryer | 800 bu/h | 实际收割顺序的第 3–6 块田 |
+| Field moisture | U(18%, 22%) | 每个田初始化采样一次，场景内固定 |
+| Dryer throughput | `D(M)=2600-100M` | 由 FIFO 队首粮食的 moisture 决定 |
 
 半挂车完整周期是：
 
@@ -89,20 +100,20 @@ Opening 速度保持独立，修改 interior 速度不会按比例重新缩放 O
 combine tank -> semi -> receiving pit -> grain leg -> wet bin -> dryer
 ```
 
-半挂车到站后，只有接收坑能够容纳整车粮食时才能开始固定 10 分钟卸货。Grain leg 是 wet bin 的输入设备，以最高 3000 bu/h 连续搬运。每块田开始时按照它在实际收割顺序中的位置分配 500 或 800 档；粮食进入 wet bin 后仍按先入先出顺序烘干，速度由队首粮食所属的顺序档位决定。
+半挂车到站后，只有接收坑能够容纳整车粮食时才能开始固定 10 分钟卸货。Grain leg 是 wet bin 的输入设备，以最高 3000 bu/h 连续搬运。从田 `F_i` 产生的每个 grain batch 都继承该田固定的 `M_i`。Wet bin 保存有序的 `(quantity, moisture, field_id)` batch 队列并严格 FIFO；dryer 永远处理队首 batch，当前速度为 `D(M_head)=2600-100M_head`。因此 18%、19%、20%、21%、22% 分别对应 800、700、600、500、400 bu/h。
 
 Wet bin 满时，grain leg 最多只能补入 dryer 同时排出的数量；接收坑随后可能装满，半挂车会在粮站等待，田间失去可用车辆后，combine tank 满载并进入 `BLOCKED`。因此 wet bin 和 dryer 会真实地向上游产生回压，而不是无限库存。
 
 ## Sequential 与 Adaptive
 
-Sequential 始终按 F1 → F2 → F3 → F4 → F5 → F6 作业。
+Sequential 始终按 F1 → F2 → F3 → F4 → F5 → F6 → F7 → F8 → F9 → F10 作业。
 
 Adaptive 只在一整块田完成后重新决策。每个候选田都预测到该田结束，估算：
 
 - Opening 与 Interior 的生产时间和产粮量；
 - 该田的“去程 + 10 分钟卸货 + 返程”运输吞吐；
 - 当前可用的 combine/semi、接收坑和 wet bin 剩余空间；
-- 当前队首粮食，以及本次顺序位置对应的 dryer 能力；
+- 当前 FIFO 队首粮食，以及候选田固定 moisture 对应的 dryer 能力；
 - 预计运输回压、dryer 回压和该田结束后留给后续田块的库存。
 
 预测得分最低的田先做。该计算是轻量确定性前瞻，而不是完整复制未来事件仿真；实际执行仍使用逐事件的物理模型。
@@ -125,10 +136,10 @@ harvested grain
 ## 默认结果含义
 
 - `harvest_completion_time_h`：所有田块完成收割的时刻；
-- `system_completion_time_h`：全部 78,000 bu 完成烘干的时刻；
+- `system_completion_time_h`：全部 130,000 bu 完成烘干的时刻；
 - `blocked_time_h`：combine tank 满且没有可接粮半挂车造成的停机；
 - `post_harvest_time_h`：收割完成后继续运输与烘干的时间；
 - `maximum_receiving_pit_inventory_bu` 和 `maximum_wet_bin_inventory_bu`：容量约束检查；
 - `mass_balance_error_bu`：最终粮食守恒误差。
 
-自动测试覆盖三种运输周期、10 分钟卸货、grain leg 速度、湿粮仓回压、按实际田块顺序分配 dryer 档位、FIFO 切换、整田约束、自适应前瞻、逐时刻粮食守恒和所有容量上限。
+自动测试覆盖三种运输周期、10 分钟卸货、grain leg 速度、湿粮仓回压、seed 可复现且策略间共享的 field moisture、FIFO 连续速率切换、整田约束、自适应前瞻、逐时刻粮食守恒和所有容量上限。
