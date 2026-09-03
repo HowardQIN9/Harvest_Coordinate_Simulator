@@ -3,6 +3,11 @@ from math import isfinite
 from random import Random
 
 
+MODE_1C = "1C"
+MODE_2C = "2C"
+MODE_2C_1GC = "2C+1GC"
+INTERIOR_MODES = (MODE_1C, MODE_2C, MODE_2C_1GC)
+
 
 @dataclass(frozen=True)
 class FieldSpec:
@@ -30,11 +35,26 @@ DEFAULT_FIELDS = (
 class SimulationConfig:
     field_specs: tuple[FieldSpec, ...] = DEFAULT_FIELDS
 
-    # Each field has a 10-acre opening; its remaining area is interior harvest.
+    # Opening is a fixed 2C operation with a separate effective rate.  The
+    # provisional rates preserve the previous rectangular/irregular field-
+    # efficiency ratios relative to the nominal 2C interior rate.
     opening_area_ac: float = 10.0
-    interior_capacity_acph: float = 7.5
-    rectangular_opening_capacity_acph: float = 6.634615384615384
-    irregular_opening_capacity_acph: float = 5.048076923076923
+    rectangular_opening_2c_rate_buph: float = 3538.4615384615386
+    irregular_opening_2c_rate_buph: float = 2692.3076923076924
+
+    # Effective in-field rates already include turning, unloading, normal
+    # delays, tank cycles, and grain-handling interaction.
+    interior_1c_rate_buph: float = 2000.0
+    interior_2c_rate_buph: float = 4000.0
+    interior_2c_1gc_rate_buph: float = 5000.0
+    legacy_interior_rate_buph: float = 1500.0
+    max_interior_mode_switches: int = 2
+    minimum_interior_mode_dwell_h: float = 30.0 / 60.0
+    interior_mode_switch_time_h: float = 0.0
+    interior_prediction_horizon_h: float = 2.0
+    predictive_blocking_penalty: float = 0.05
+    harvest_work_window_h: float = 14.0
+    harvest_rest_window_h: float = 10.0
     header_width_ft: float = 30.0
     yield_bu_per_ac: float = 200.0
 
@@ -65,8 +85,11 @@ class SimulationConfig:
 
     def __post_init__(self) -> None:
         positive = (
-            "interior_capacity_acph", "rectangular_opening_capacity_acph",
-            "irregular_opening_capacity_acph", "yield_bu_per_ac", "dt_h",
+            "rectangular_opening_2c_rate_buph", "irregular_opening_2c_rate_buph",
+            "interior_1c_rate_buph", "interior_2c_rate_buph",
+            "interior_2c_1gc_rate_buph", "legacy_interior_rate_buph",
+            "interior_prediction_horizon_h", "harvest_work_window_h",
+            "yield_bu_per_ac", "dt_h",
             "combine_tank_capacity_bu", "semi_capacity_bu", "semi_unload_time_h",
             "receiving_pit_capacity_bu", "grain_leg_rate_buph", "wet_bin_capacity_bu",
             "dryer_intercept_buph", "dryer_moisture_slope_buph_per_pct",
@@ -80,8 +103,27 @@ class SimulationConfig:
             raise ValueError("opening_area_ac must be finite and nonnegative")
         if not isfinite(self.switch_time_h) or self.switch_time_h < 0:
             raise ValueError("switch_time_h must be finite and nonnegative")
+        if (not isfinite(self.minimum_interior_mode_dwell_h)
+                or self.minimum_interior_mode_dwell_h < 0):
+            raise ValueError("minimum_interior_mode_dwell_h must be finite and nonnegative")
+        if (not isfinite(self.interior_mode_switch_time_h)
+                or self.interior_mode_switch_time_h < 0):
+            raise ValueError("interior_mode_switch_time_h must be finite and nonnegative")
+        if (not isfinite(self.predictive_blocking_penalty)
+                or self.predictive_blocking_penalty < 0):
+            raise ValueError("predictive_blocking_penalty must be finite and nonnegative")
+        if (not isfinite(self.harvest_rest_window_h)
+                or self.harvest_rest_window_h < 0):
+            raise ValueError("harvest_rest_window_h must be finite and nonnegative")
         if not isinstance(self.semi_count, int) or isinstance(self.semi_count, bool) or self.semi_count < 1:
             raise ValueError("semi_count must be a positive integer")
+        if (not isinstance(self.max_interior_mode_switches, int)
+                or isinstance(self.max_interior_mode_switches, bool)
+                or self.max_interior_mode_switches < 0):
+            raise ValueError("max_interior_mode_switches must be a nonnegative integer")
+        if not (self.interior_1c_rate_buph < self.interior_2c_rate_buph
+                < self.interior_2c_1gc_rate_buph):
+            raise ValueError("Interior rates must satisfy 1C < 2C < 2C+1GC")
         if not isinstance(self.random_seed, int) or isinstance(self.random_seed, bool):
             raise ValueError("random_seed must be an integer")
         if (not isfinite(self.moisture_min_pct)
@@ -123,3 +165,19 @@ class SimulationConfig:
         """Linear calibration: D(M) = intercept - slope * M."""
         return (self.dryer_intercept_buph
                 - self.dryer_moisture_slope_buph_per_pct * moisture_pct)
+
+    def opening_rate_buph(self, geometry: str) -> float:
+        return (self.rectangular_opening_2c_rate_buph
+                if geometry == "rectangular"
+                else self.irregular_opening_2c_rate_buph)
+
+    def interior_rate_buph(self, mode: str) -> float:
+        rates = {
+            MODE_1C: self.interior_1c_rate_buph,
+            MODE_2C: self.interior_2c_rate_buph,
+            MODE_2C_1GC: self.interior_2c_1gc_rate_buph,
+        }
+        try:
+            return rates[mode]
+        except KeyError as error:
+            raise ValueError(f"Unknown interior mode: {mode}") from error

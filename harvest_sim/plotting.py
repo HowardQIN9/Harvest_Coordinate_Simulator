@@ -16,21 +16,25 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
     if not rows:
         rows = result.time_series[:1]
 
-    width, height = 1800, 3180
+    width, height = 1800, 3260
     left, right, panel_h, stride = 210, 60, 220, 330
     plot_w = width - left - right
-    tops = [160 + index * stride for index in range(9)]
+    tops = [230 + index * stride for index in range(9)]
     max_t = max((float(row["time_h"]) for row in rows), default=0.0) or 1.0
     parts = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">',
         '<rect width="100%" height="100%" fill="white"/>',
         '<style>text {font-family:Arial,sans-serif;fill:#1e293b;font-size:20pt} '
         '.tick {font-size:20pt;fill:#64748b} .main-title {font-size:28pt;font-weight:bold}</style>',
-        f'<text class="main-title" x="{left}" y="42">Harvest / transport / wet-bin simulation — {escape(result.policy)}</text>',
-        f'<text x="{left}" y="82">Wet bin {config.wet_bin_capacity_bu:g} bu | Grain leg {config.grain_leg_rate_buph:g} bu/h | '
+        f'<text class="main-title" x="{left}" y="38">Harvest / transport / wet-bin simulation — {escape(result.policy)}</text>',
+        f'<text x="{left}" y="75">Opening 2C: rect {config.rectangular_opening_2c_rate_buph:g}, irregular {config.irregular_opening_2c_rate_buph:g} bu/h | '
+        f'Interior 1C / 2C / 2C+1GC: {config.interior_1c_rate_buph:g} / {config.interior_2c_rate_buph:g} / {config.interior_2c_1gc_rate_buph:g} bu/h</text>',
+        f'<text x="{left}" y="112">Wet bin {config.wet_bin_capacity_bu:g} bu | Grain leg {config.grain_leg_rate_buph:g} bu/h | '
         f'Dryer D(M) = {config.dryer_intercept_buph:g} - {config.dryer_moisture_slope_buph_per_pct:g}M bu/h</text>',
-        f'<text x="{left}" y="118">Field moisture U({config.moisture_min_pct:g}%, {config.moisture_max_pct:g}%), seed {config.random_seed} | '
+        f'<text x="{left}" y="149">Field moisture U({config.moisture_min_pct:g}%, {config.moisture_max_pct:g}%), seed {config.random_seed} | '
         f'Trips use 5, 15, or 20 min outbound + {config.semi_unload_time_h * 60:g} min unload + equal return time</text>',
+        f'<text x="{left}" y="186">Harvest schedule from t=0: {config.harvest_work_window_h:g} h active + '
+        f'{config.harvest_rest_window_h:g} h scheduled rest; downstream continues during rest</text>',
     ]
 
     def x(time_h: float) -> float:
@@ -135,26 +139,34 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
     line(5, "dryer_rate_buph", dryer_max, "#9333ea")
     legend(5, [("Active dryer rate", "#9333ea")])
 
-    panel(6, "Combine task/state", None)
+    panel(6, "Harvest mode/state", None)
     combine_colors = {
-        "Opening": "#d97706",
-        "InteriorHarvest": "#16a34a",
+        "Opening-2C": "#d97706",
+        "1C": "#16a34a",
+        "2C": "#0891b2",
+        "2C+1GC": "#7c3aed",
         "SWITCHING": "#64748b",
+        "MODE_SWITCHING": "#db2777",
         "BLOCKED": "#dc2626",
+        "HARVEST_REST": "#334155",
         "POST_HARVEST": "#cbd5e1",
     }
     intervals = []
     for row in rows:
         if row["duration_h"] <= 0:
             continue
-        label = (row["current_task"] if row["combine_state"] == "HARVESTING"
+        label = (row["operating_mode"] if row["combine_state"] == "HARVESTING"
                  else row["combine_state"])
         intervals.append((row["time_h"] - row["duration_h"], row["time_h"], label))
     state_bars(intervals, tops[6], panel_h, combine_colors)
-    legend(6, [("Opening", combine_colors["Opening"]),
-               ("Interior", combine_colors["InteriorHarvest"]),
-               ("Switching", combine_colors["SWITCHING"]),
+    legend(6, [("Opening 2C", combine_colors["Opening-2C"]),
+               ("1C", combine_colors["1C"]),
+               ("2C", combine_colors["2C"]),
+               ("2C+1GC", combine_colors["2C+1GC"]),
+               ("Field switch", combine_colors["SWITCHING"]),
+               ("Mode switch", combine_colors["MODE_SWITCHING"]),
                ("Blocked", combine_colors["BLOCKED"]),
+               ("Scheduled rest", combine_colors["HARVEST_REST"]),
                ("Post-harvest", combine_colors["POST_HARVEST"])])
 
     area_max = (max(row["cumulative_harvested_ac"] for row in rows)
@@ -181,6 +193,6 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
         parts.append(f'<rect x="{left}" y="{top}" width="{plot_w}" height="{panel_h}" fill="none" stroke="#94a3b8"/>')
         if 0 < harvest_end <= max_t:
             parts.append(f'<line x1="{x(harvest_end):.2f}" x2="{x(harvest_end):.2f}" y1="{top}" y2="{top + panel_h}" stroke="#0f172a" stroke-width="2" stroke-dasharray="7 7"/>')
-    parts.append(f'<text x="{left}" y="3160">Horizontal axes: time (h). Dashed vertical line: harvest complete; drying may continue afterward.</text>')
+    parts.append(f'<text x="{left}" y="3240">Horizontal axes: time (h). Dashed vertical line: harvest complete; drying may continue afterward.</text>')
     parts.append("</svg>")
     output.write_text("\n".join(parts), encoding="utf-8")

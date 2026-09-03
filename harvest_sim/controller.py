@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .config import SimulationConfig
+from .config import (INTERIOR_MODES, MODE_2C_1GC,
+                     SimulationConfig)
 from .field import INTERIOR, Field
 
 TaskRef = tuple[int, str]
@@ -21,6 +22,9 @@ class SequentialController:
             if tasks:
                 return index, tasks[0]
         return None
+
+    def choose_interior_mode(self, **_: float) -> str:
+        return MODE_2C_1GC
 
 
 @dataclass
@@ -46,11 +50,6 @@ class AdaptiveController:
         if current in feasible:
             return current
 
-        def opening_capacity(field: Field) -> float:
-            return (c.rectangular_opening_capacity_acph
-                    if field.geometry == "rectangular"
-                    else c.irregular_opening_capacity_acph)
-
         def forecast(task: TaskRef) -> tuple[float, float, int]:
             """Estimate the whole candidate field, including future backpressure.
 
@@ -58,8 +57,12 @@ class AdaptiveController:
             combine is not allowed to switch again during that field.
             """
             field = fields[task[0]]
-            productive_h = (field.opening_remaining_ac / opening_capacity(field)
-                            + field.interior_remaining_ac / c.interior_capacity_acph)
+            productive_h = (
+                field.opening_remaining_ac * c.yield_bu_per_ac
+                / c.opening_rate_buph(field.geometry)
+                + field.interior_remaining_ac * c.yield_bu_per_ac
+                / c.interior_2c_rate_buph
+            )
             grain_bu = (field.opening_remaining_ac + field.interior_remaining_ac) * c.yield_bu_per_ac
             travel_h = field.one_way_travel_min / 60.0
             truck_cycle_h = 2.0 * travel_h + c.semi_unload_time_h
@@ -88,3 +91,48 @@ class AdaptiveController:
             return score, elapsed_h, task[0]
 
         return min(feasible, key=forecast)
+
+    def choose_interior_mode(
+        self,
+        *,
+        remaining_grain_bu: float,
+        field_mobile_free_bu: float,
+        system_buffer_free_bu: float,
+        transport_rate_buph: float,
+        active_dryer_rate_buph: float,
+        **_: float,
+    ) -> str:
+        """Select production intensity using a fixed-work rolling forecast.
+
+        Every candidate is asked to process the same look-ahead grain volume.
+        Its score includes nominal production time, predicted forced blocking,
+        and a small extra penalty on blocking so an intentional slower mode wins
+        when two modes have nearly equal completion time.
+        """
+        c = self.config
+        max_rate = c.interior_2c_1gc_rate_buph
+        target_bu = min(remaining_grain_bu,
+                        max_rate * c.interior_prediction_horizon_h)
+        dryer_rate = max(active_dryer_rate_buph, c.numerical_tolerance)
+        transport_rate = max(transport_rate_buph, c.numerical_tolerance)
+
+        def forecast(mode: str) -> tuple[float, float, float]:
+            rate = c.interior_rate_buph(mode)
+            nominal_h = target_bu / rate
+            transport_overflow = max(
+                0.0,
+                target_bu - field_mobile_free_bu - transport_rate * nominal_h,
+            )
+            downstream_overflow = max(
+                0.0,
+                target_bu - system_buffer_free_bu - dryer_rate * nominal_h,
+            )
+            forced_block_h = max(
+                transport_overflow / transport_rate,
+                downstream_overflow / dryer_rate,
+            )
+            score = nominal_h + (1.0 + c.predictive_blocking_penalty) * forced_block_h
+            # Prefer less forced blocking, then higher production, on close scores.
+            return score, forced_block_h, -rate
+
+        return min(INTERIOR_MODES, key=forecast)

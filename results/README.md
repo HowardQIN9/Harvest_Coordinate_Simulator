@@ -4,7 +4,7 @@
 
 ## Current
 
-`current/fields10_seed42_moisture18-22_wetbin10000_leg3000/` 是当前 10 田默认场景：
+`current/fields10_seed42_moisture18-22_wetbin10000_leg3000/` 是当前10田默认场景。Opening固定使用独立2C能力，Sequential的Interior固定使用2C+1GC；Adaptive可在1C、2C和2C+1GC之间动态切换，每田最多2次、最短dwell 30分钟：
 
 ```text
 policy_comparison.csv
@@ -24,6 +24,12 @@ adaptive/
 ```
 
 运行 `python run_baseline.py --policy sequential` 或 `--policy adaptive` 会更新对应策略目录。运行 `python run_experiments.py` 会更新策略对比和两张完整图。
+
+## 14h harvest / 10h rest
+
+`harvest_schedule_14h_on_10h_off/` 保存从`t=0`开始、每天收割14小时后计划停工10小时的独立场景结果。计划停工期间不产生新粮，但semi、grain leg与dryer继续运行；该目录不会覆盖`current/`中的连续收割结果。
+
+该场景根目录中的`machine_hours_summary.csv`比较两种策略的全季C、GC和semi设备小时，`daily_machine_hours_comparison.csv`合并两种策略的逐日结果；每个策略目录中的`daily_machine_hours.csv`按24小时列出active与occupied machine-hours。
 
 ## Archive (local only)
 

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
+from math import inf, isfinite
 from typing import Any
 
-from .config import SimulationConfig
+from .accounting import calculate_daily_machine_hours, summarize_machine_hours
+from .config import (INTERIOR_MODES, MODE_2C, MODE_2C_1GC,
+                     SimulationConfig)
 from .controller import AdaptiveController, SequentialController, TaskRef
 from .downstream import AT_FIELD, Downstream
 from .field import INTERIOR, Field
@@ -42,31 +44,84 @@ class Simulator:
         else:
             raise ValueError(f"Unknown policy: {policy}")
 
-    def capacity(self, field: Field, task: str) -> float:
+    def capacity(self, field: Field, task: str,
+                 interior_mode: str = MODE_2C) -> float:
+        """Effective capacity in ac/h; no further efficiency deduction applies."""
         if task == INTERIOR:
-            return self.config.interior_capacity_acph
-        return (self.config.rectangular_opening_capacity_acph
-                if field.geometry == "rectangular"
-                else self.config.irregular_opening_capacity_acph)
+            rate_buph = self.config.interior_rate_buph(interior_mode)
+        else:
+            rate_buph = self.config.opening_rate_buph(field.geometry)
+        return rate_buph / self.config.yield_bu_per_ac
 
     def run(self) -> SimulationResult:
         c, d = self.config, self.downstream
-        productive_h = blocked_h = switching_h = 0.0
+        productive_h = blocked_h = switching_h = mode_switching_h = 0.0
+        scheduled_rest_h = 0.0
         harvested_ac = generated_bu = 0.0
         switches = 0
+        interior_mode_switches = 0
+        intentional_slowdown_productive_h = 0.0
+        intentional_rate_reduction_capacity_bu = 0.0
+        productive_h_by_mode = {mode: 0.0 for mode in INTERIOR_MODES}
         current: TaskRef | None = None
         combine_field: int | None = None
         field_order: list[str] = []
         switch_remaining_h = 0.0
         pending: TaskRef | None = None
+        current_interior_mode: str | None = None
+        pending_interior_mode: str | None = None
+        interior_mode_dwell_h = 0.0
+        interior_mode_switch_remaining_h = 0.0
+        field_interior_mode_switches = 0
+        mode_sequences: dict[str, list[str]] = {}
         harvest_completion_h: float | None = None
         harvest_end_inventory: dict[str, Any] = {}
         series: list[dict[str, Any]] = []
 
         def begin_field(field_index: int) -> None:
+            nonlocal current_interior_mode, pending_interior_mode
+            nonlocal interior_mode_dwell_h, interior_mode_switch_remaining_h
+            nonlocal field_interior_mode_switches
             field = self.fields[field_index]
             d.set_field_context(field.field_id, field.one_way_travel_min)
             field_order.append(field.field_id)
+            current_interior_mode = None
+            pending_interior_mode = None
+            interior_mode_dwell_h = 0.0
+            interior_mode_switch_remaining_h = 0.0
+            field_interior_mode_switches = 0
+            mode_sequences[field.field_id] = []
+
+        def field_mobile_free_bu() -> float:
+            free = c.combine_tank_capacity_bu - d.combine_tank_bu
+            free += sum(c.semi_capacity_bu - semi.load_bu
+                        for semi in d.semis if semi.state == AT_FIELD)
+            return free
+
+        def system_buffer_free_bu() -> float:
+            capacity = (c.combine_tank_capacity_bu
+                        + c.semi_count * c.semi_capacity_bu
+                        + c.receiving_pit_capacity_bu
+                        + c.wet_bin_capacity_bu)
+            return capacity - d.unprocessed_grain_bu
+
+        def transport_rate_buph(field: Field) -> float:
+            cycle_h = 2.0 * field.one_way_travel_min / 60.0 + c.semi_unload_time_h
+            return min(
+                c.semi_count * c.semi_capacity_bu / cycle_h,
+                c.semi_capacity_bu / c.semi_unload_time_h,
+                c.grain_leg_rate_buph,
+            )
+
+        def harvest_window() -> tuple[bool, float]:
+            """Return whether harvesting is open and hours to its next boundary."""
+            if c.harvest_rest_window_h <= c.numerical_tolerance:
+                return True, inf
+            cycle_h = c.harvest_work_window_h + c.harvest_rest_window_h
+            phase_h = d.time_h % cycle_h
+            if phase_h < c.harvest_work_window_h - c.numerical_tolerance:
+                return True, c.harvest_work_window_h - phase_h
+            return False, cycle_h - phase_h
 
         def record(state: str, active: TaskRef | None, duration_h: float = 0.0,
                    event: str = "") -> None:
@@ -82,11 +137,26 @@ class Simulator:
                 raise AssertionError("Receiving pit outside physical bounds")
             if not -c.numerical_tolerance <= d.wet_bin_inventory_bu <= c.wet_bin_capacity_bu + c.numerical_tolerance:
                 raise AssertionError("Wet bin outside physical bounds")
+            active_mode = ""
+            active_rate_buph = 0.0
+            if active:
+                active_field = self.fields[active[0]]
+                if active[1] == INTERIOR and current_interior_mode:
+                    active_mode = current_interior_mode
+                    active_rate_buph = c.interior_rate_buph(current_interior_mode)
+                elif active[1] != INTERIOR:
+                    active_mode = "Opening-2C"
+                    active_rate_buph = c.opening_rate_buph(active_field.geometry)
             series.append({
                 "time_h": d.time_h,
                 "duration_h": duration_h,
                 "current_field": self.fields[active[0]].field_id if active else "",
                 "current_task": active[1] if active else "",
+                "operating_mode": active_mode,
+                "effective_harvest_rate_buph": active_rate_buph,
+                "interior_mode_dwell_h": (interior_mode_dwell_h
+                                           if active_mode in INTERIOR_MODES else 0.0),
+                "interior_mode_switches_current_field": field_interior_mode_switches,
                 "current_moisture_pct": (self.fields[active[0]].moisture_pct
                                            if active else ""),
                 "combine_state": state,
@@ -142,26 +212,51 @@ class Simulator:
                     begin_field(combine_field)
                 continue
 
+            if interior_mode_switch_remaining_h > c.numerical_tolerance:
+                step = min(step, interior_mode_switch_remaining_h)
+                d.advance_time(step)
+                interior_mode_switch_remaining_h -= step
+                mode_switching_h += step
+                record("MODE_SWITCHING", current, step)
+                if interior_mode_switch_remaining_h <= c.numerical_tolerance:
+                    if pending_interior_mode is None or combine_field is None:
+                        raise AssertionError("Interior mode switch has no destination")
+                    current_interior_mode = pending_interior_mode
+                    pending_interior_mode = None
+                    interior_mode_dwell_h = 0.0
+                    mode_sequences[self.fields[combine_field].field_id].append(
+                        current_interior_mode)
+                    record("MODE_EVENT", current,
+                           event=f"MODE_SWITCH_COMPLETE:{current_interior_mode}")
+                continue
+
+            harvesting_open, window_remaining_h = harvest_window()
+            if not harvesting_open:
+                # Harvesting stops, but partial field-side loads are released so
+                # transport, the grain leg, and the dryer can keep working.
+                d.dispatch_final_loads()
+                step = min(step, d.next_event_h - d.time_h, window_remaining_h)
+                d.advance_time(step)
+                scheduled_rest_h += step
+                record("HARVEST_REST", current, step)
+                continue
+
+            # Do not let a productive or blocked interval cross into the
+            # scheduled rest window.
+            step = min(step, window_remaining_h)
+
             # A selected field must finish both phases before another field can start.
             if combine_field is not None and not self.fields[combine_field].field_complete:
                 choice = (combine_field, self.fields[combine_field].available_tasks()[0])
             else:
-                field_mobile_free = c.combine_tank_capacity_bu - d.combine_tank_bu
-                field_mobile_free += sum(
-                    c.semi_capacity_bu - semi.load_bu
-                    for semi in d.semis if semi.state == AT_FIELD)
-                system_capacity = (c.combine_tank_capacity_bu
-                                   + c.semi_count * c.semi_capacity_bu
-                                   + c.receiving_pit_capacity_bu
-                                   + c.wet_bin_capacity_bu)
                 choice = self.controller.choose(
                     self.fields,
                     current,
                     receiving_pressure=d.receiving_pressure,
                     downstream_inventory_bu=(d.receiving_pit_inventory_bu
                                              + d.wet_bin_inventory_bu),
-                    field_mobile_free_bu=field_mobile_free,
-                    system_buffer_free_bu=system_capacity - d.unprocessed_grain_bu,
+                    field_mobile_free_bu=field_mobile_free_bu(),
+                    system_buffer_free_bu=system_buffer_free_bu(),
                     current_dryer_rate_buph=d.current_dryer_rate_buph,
                 )
             if choice is None:
@@ -179,13 +274,59 @@ class Simulator:
                 begin_field(combine_field)
 
             field = self.fields[current[0]]
-            capacity = self.capacity(field, current[1])
+            if current[1] == INTERIOR:
+                may_choose_mode = (
+                    current_interior_mode is None
+                    or (self.controller.name == "adaptive"
+                        and field_interior_mode_switches < c.max_interior_mode_switches
+                        and interior_mode_dwell_h + c.numerical_tolerance
+                        >= c.minimum_interior_mode_dwell_h)
+                )
+                if may_choose_mode:
+                    proposed_mode = self.controller.choose_interior_mode(
+                        remaining_grain_bu=(field.interior_remaining_ac
+                                            * c.yield_bu_per_ac),
+                        field_mobile_free_bu=field_mobile_free_bu(),
+                        system_buffer_free_bu=system_buffer_free_bu(),
+                        transport_rate_buph=transport_rate_buph(field),
+                        active_dryer_rate_buph=(d.current_dryer_rate_buph
+                                                or c.dryer_rate_for_moisture(
+                                                    field.moisture_pct)),
+                    )
+                    if current_interior_mode is None:
+                        current_interior_mode = proposed_mode
+                        interior_mode_dwell_h = 0.0
+                        mode_sequences[field.field_id].append(proposed_mode)
+                        record("MODE_EVENT", current,
+                               event=f"MODE_START:{proposed_mode}")
+                    elif proposed_mode != current_interior_mode:
+                        old_mode = current_interior_mode
+                        interior_mode_switches += 1
+                        field_interior_mode_switches += 1
+                        if c.interior_mode_switch_time_h > c.numerical_tolerance:
+                            pending_interior_mode = proposed_mode
+                            interior_mode_switch_remaining_h = c.interior_mode_switch_time_h
+                            record("MODE_EVENT", current,
+                                   event=f"MODE_SWITCH_START:{old_mode}->{proposed_mode}")
+                            continue
+                        current_interior_mode = proposed_mode
+                        interior_mode_dwell_h = 0.0
+                        mode_sequences[field.field_id].append(proposed_mode)
+                        record("MODE_EVENT", current,
+                               event=f"MODE_SWITCH:{old_mode}->{proposed_mode}")
+                if current_interior_mode is None:
+                    raise AssertionError("Interior harvesting requires an operating mode")
+                capacity = self.capacity(field, current[1], current_interior_mode)
+            else:
+                capacity = self.capacity(field, current[1])
             free_tank_bu = c.combine_tank_capacity_bu - d.combine_tank_bu
             if free_tank_bu <= c.numerical_tolerance:
                 if any(semi.state == AT_FIELD for semi in d.semis):
                     raise AssertionError("Combine blocked while a semi can receive grain")
                 d.advance_time(step)
                 blocked_h += step
+                if current[1] == INTERIOR:
+                    interior_mode_dwell_h += step
                 record("BLOCKED", current, step)
                 continue
 
@@ -199,6 +340,17 @@ class Simulator:
             harvested_ac += acres
             generated_bu += grain
             productive_h += step
+            if current[1] == INTERIOR:
+                if current_interior_mode is None:
+                    raise AssertionError("Missing mode during interior harvest")
+                interior_mode_dwell_h += step
+                productive_h_by_mode[current_interior_mode] += step
+                if current_interior_mode != MODE_2C_1GC:
+                    intentional_slowdown_productive_h += step
+                    intentional_rate_reduction_capacity_bu += (
+                        c.interior_2c_1gc_rate_buph
+                        - c.interior_rate_buph(current_interior_mode)
+                    ) * step
             record("HARVESTING", current, step)
             if current[1] not in field.available_tasks():
                 current = None
@@ -222,6 +374,10 @@ class Simulator:
                 f"{field_id}:{c.dryer_rate_for_moisture(field_by_id[field_id].moisture_pct):.4f}"
                 for field_id in field_order
             ),
+            "interior_mode_sequence": "; ".join(
+                f"{field_id}:{'->'.join(mode_sequences[field_id])}"
+                for field_id in field_order
+            ),
             "random_seed": c.random_seed,
             "moisture_min_pct": c.moisture_min_pct,
             "moisture_max_pct": c.moisture_max_pct,
@@ -230,6 +386,17 @@ class Simulator:
             "wet_bin_capacity_bu": c.wet_bin_capacity_bu,
             "dryer_intercept_buph": c.dryer_intercept_buph,
             "dryer_moisture_slope_buph_per_pct": c.dryer_moisture_slope_buph_per_pct,
+            "rectangular_opening_2c_rate_buph": c.rectangular_opening_2c_rate_buph,
+            "irregular_opening_2c_rate_buph": c.irregular_opening_2c_rate_buph,
+            "interior_1c_rate_buph": c.interior_1c_rate_buph,
+            "interior_2c_rate_buph": c.interior_2c_rate_buph,
+            "interior_2c_1gc_rate_buph": c.interior_2c_1gc_rate_buph,
+            "legacy_interior_rate_buph": c.legacy_interior_rate_buph,
+            "minimum_interior_mode_dwell_min": c.minimum_interior_mode_dwell_h * 60.0,
+            "maximum_interior_mode_switches_per_field": c.max_interior_mode_switches,
+            "interior_mode_switch_time_min": c.interior_mode_switch_time_h * 60.0,
+            "harvest_work_window_h": c.harvest_work_window_h,
+            "harvest_rest_window_h": c.harvest_rest_window_h,
             "semi_unload_time_min": c.semi_unload_time_h * 60.0,
             "combine_tank_capacity_bu": c.combine_tank_capacity_bu,
             "semi_count": c.semi_count,
@@ -240,8 +407,17 @@ class Simulator:
             "post_harvest_time_h": d.time_h - harvest_completion_h,
             "productive_harvest_time_h": productive_h,
             "blocked_time_h": 0.0 if blocked_h <= c.numerical_tolerance else blocked_h,
+            "forced_blocking_time_h": 0.0 if blocked_h <= c.numerical_tolerance else blocked_h,
             "switching_time_h": switching_h,
+            "interior_mode_switching_time_h": mode_switching_h,
+            "scheduled_harvest_rest_time_h": scheduled_rest_h,
             "number_of_field_switches": switches,
+            "number_of_interior_mode_switches": interior_mode_switches,
+            "intentional_slowdown_productive_h": intentional_slowdown_productive_h,
+            "intentional_rate_reduction_capacity_bu": intentional_rate_reduction_capacity_bu,
+            "interior_1c_productive_h": productive_h_by_mode["1C"],
+            "interior_2c_productive_h": productive_h_by_mode["2C"],
+            "interior_2c_1gc_productive_h": productive_h_by_mode["2C+1GC"],
             "combine_utilization": (productive_h / harvest_completion_h
                                     if harvest_completion_h else 0.0),
             "total_harvested_ac": harvested_ac,
@@ -264,8 +440,10 @@ class Simulator:
             "maximum_wet_bin_inventory_bu": max(row["wet_bin_inventory_bu"] for row in series),
             "number_of_semi_trips": sum(semi.trips for semi in d.semis),
             "final_unprocessed_grain_bu": d.unprocessed_grain_bu,
-            "mass_balance_error_bu": (0.0 if abs(mass_error) <= c.numerical_tolerance
+            "mass_balance_error_bu": (0.0 if abs(mass_error) <= 1e-6
                                       else mass_error),
         }
+        daily_machine_hours = calculate_daily_machine_hours(series, c.semi_count)
+        metrics.update(summarize_machine_hours(daily_machine_hours))
         return SimulationResult(self.controller.name, metrics, series,
                                 self.fields, d.events)

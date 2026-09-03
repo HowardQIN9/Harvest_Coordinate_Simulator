@@ -1,8 +1,11 @@
 import unittest
 from dataclasses import replace
 
-from harvest_sim import SimulationConfig, Simulator
-from harvest_sim.config import FieldSpec
+from harvest_sim import (SimulationConfig, Simulator,
+                         calculate_daily_machine_hours,
+                         summarize_machine_hours)
+from harvest_sim.config import (INTERIOR_MODES, MODE_1C, MODE_2C,
+                                MODE_2C_1GC, FieldSpec)
 from harvest_sim.downstream import (
     AT_FIELD,
     RETURNING,
@@ -145,7 +148,9 @@ class SimulatorTests(unittest.TestCase):
                 )
                 accounted = (metrics["productive_harvest_time_h"]
                              + metrics["blocked_time_h"]
-                             + metrics["switching_time_h"])
+                             + metrics["switching_time_h"]
+                             + metrics["interior_mode_switching_time_h"]
+                             + metrics["scheduled_harvest_rest_time_h"])
                 self.assertAlmostEqual(metrics["harvest_completion_time_h"],
                                        accounted, places=6)
                 self.assertAlmostEqual(metrics["mass_balance_error_bu"], 0.0)
@@ -219,6 +224,136 @@ class SimulatorTests(unittest.TestCase):
         self.assertLess(adaptive.metrics["blocked_time_h"],
                         sequential.metrics["blocked_time_h"])
 
+    def test_effective_opening_and_interior_rates(self):
+        c = SimulationConfig()
+        simulator = Simulator(c)
+        irregular = simulator.fields[0]
+        rectangular = simulator.fields[1]
+        self.assertAlmostEqual(
+            simulator.capacity(irregular, OPENING) * c.yield_bu_per_ac,
+            c.irregular_opening_2c_rate_buph,
+        )
+        self.assertAlmostEqual(
+            simulator.capacity(rectangular, OPENING) * c.yield_bu_per_ac,
+            c.rectangular_opening_2c_rate_buph,
+        )
+        for mode in INTERIOR_MODES:
+            self.assertAlmostEqual(
+                simulator.capacity(irregular, INTERIOR, mode) * c.yield_bu_per_ac,
+                c.interior_rate_buph(mode),
+            )
+        self.assertEqual(c.interior_rate_buph(MODE_1C), 2000.0)
+        self.assertEqual(c.interior_rate_buph(MODE_2C), 4000.0)
+        self.assertEqual(c.interior_rate_buph(MODE_2C_1GC), 5000.0)
+
+    def test_interior_mode_control_respects_switch_and_dwell_limits(self):
+        c = SimulationConfig()
+        sequential = Simulator(c, "sequential").run()
+        sequential_modes = {
+            row["operating_mode"] for row in sequential.time_series
+            if row["current_task"] == INTERIOR
+            and row["combine_state"] in ("HARVESTING", "BLOCKED")
+        }
+        self.assertEqual(sequential_modes, {MODE_2C_1GC})
+        self.assertEqual(sequential.metrics["number_of_interior_mode_switches"], 0)
+
+        adaptive = Simulator(c, "adaptive").run()
+        self.assertGreater(adaptive.metrics["intentional_slowdown_productive_h"], 0.0)
+        self.assertLessEqual(
+            adaptive.metrics["number_of_interior_mode_switches"],
+            len(c.field_specs) * c.max_interior_mode_switches,
+        )
+        events_by_field = {}
+        for row in adaptive.time_series:
+            if not str(row["event"]).startswith("MODE_"):
+                continue
+            events_by_field.setdefault(row["current_field"], []).append(row)
+        for field_id, events in events_by_field.items():
+            switches = [row for row in events if "SWITCH" in row["event"]]
+            self.assertLessEqual(len(switches), c.max_interior_mode_switches,
+                                 field_id)
+            for first, second in zip(events, events[1:]):
+                self.assertGreaterEqual(
+                    second["time_h"] - first["time_h"] + c.numerical_tolerance,
+                    c.minimum_interior_mode_dwell_h,
+                    field_id,
+                )
+
+    def test_optional_mode_switch_cost_is_counted(self):
+        c = replace(
+            SimulationConfig(),
+            field_specs=(FieldSpec("F1", 50.0, "irregular", 5.0),),
+            interior_mode_switch_time_h=5 / 60,
+        )
+        result = Simulator(c, "adaptive", (20.0,)).run()
+        switches = result.metrics["number_of_interior_mode_switches"]
+        self.assertGreater(switches, 0)
+        self.assertAlmostEqual(
+            result.metrics["interior_mode_switching_time_h"],
+            switches * 5 / 60,
+        )
+        accounted = (result.metrics["productive_harvest_time_h"]
+                     + result.metrics["blocked_time_h"]
+                     + result.metrics["switching_time_h"]
+                     + result.metrics["interior_mode_switching_time_h"]
+                     + result.metrics["scheduled_harvest_rest_time_h"])
+        self.assertAlmostEqual(result.metrics["harvest_completion_time_h"],
+                               accounted)
+
+    def test_fourteen_hour_harvest_then_ten_hour_rest(self):
+        c = replace(
+            SimulationConfig(),
+            field_specs=(FieldSpec("F1", 500.0, "rectangular", 0.0),),
+            combine_tank_capacity_bu=200000.0,
+            wet_bin_capacity_bu=200000.0,
+            grain_leg_rate_buph=100000.0,
+            dryer_intercept_buph=100000.0,
+            dryer_moisture_slope_buph_per_pct=1.0,
+        )
+        result = Simulator(c, "sequential", (20.0,)).run()
+        self.assertAlmostEqual(
+            result.metrics["scheduled_harvest_rest_time_h"], 10.0, places=6)
+        rest_rows = [row for row in result.time_series
+                     if row["combine_state"] == "HARVEST_REST"]
+        self.assertTrue(rest_rows)
+        self.assertAlmostEqual(rest_rows[0]["time_h"] - rest_rows[0]["duration_h"],
+                               14.0, places=6)
+        self.assertAlmostEqual(rest_rows[-1]["time_h"], 24.0, places=6)
+        for row in result.time_series:
+            if row["combine_state"] != "HARVESTING":
+                continue
+            midpoint_h = row["time_h"] - row["duration_h"] / 2.0
+            self.assertLess(midpoint_h % 24.0, 14.0)
+
+    def test_machine_hour_accounting(self):
+        c = SimulationConfig()
+        result = Simulator(c, "sequential").run()
+        daily = calculate_daily_machine_hours(result.time_series, c.semi_count)
+        summary = summarize_machine_hours(daily)
+        self.assertGreater(len(daily), 1)
+        self.assertAlmostEqual(
+            summary["combine_productive_machine_h"],
+            2.0 * result.metrics["productive_harvest_time_h"],
+        )
+        self.assertAlmostEqual(
+            summary["combine_switching_machine_h"],
+            2.0 * result.metrics["switching_time_h"],
+        )
+        self.assertAlmostEqual(
+            summary["grain_cart_productive_machine_h"],
+            result.metrics["interior_2c_1gc_productive_h"],
+        )
+        self.assertAlmostEqual(
+            summary["semi_active_machine_h"],
+            summary["semi_driving_machine_h"]
+            + summary["semi_unloading_machine_h"],
+        )
+        for resource in ("combine", "grain_cart", "semi", "total"):
+            self.assertLessEqual(summary[f"{resource}_active_machine_h"],
+                                 summary[f"{resource}_occupied_machine_h"])
+        for key, value in summary.items():
+            self.assertAlmostEqual(value, result.metrics[key])
+
     def test_invalid_configurations(self):
         cases = [
             {"semi_count": 0},
@@ -230,6 +365,12 @@ class SimulatorTests(unittest.TestCase):
             {"random_seed": True},
             {"moisture_min_pct": 22.0},
             {"dryer_intercept_buph": 2200.0},
+            {"interior_1c_rate_buph": 4000.0},
+            {"max_interior_mode_switches": -1},
+            {"minimum_interior_mode_dwell_h": -0.1},
+            {"interior_mode_switch_time_h": -0.1},
+            {"harvest_work_window_h": 0.0},
+            {"harvest_rest_window_h": -0.1},
         ]
         for values in cases:
             with self.subTest(values=values), self.assertRaises(ValueError):
