@@ -32,9 +32,11 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
         f'<text x="{left}" y="112">Wet bin {config.wet_bin_capacity_bu:g} bu | Grain leg {config.grain_leg_rate_buph:g} bu/h | '
         f'Dryer D(M) = {config.dryer_intercept_buph:g} - {config.dryer_moisture_slope_buph_per_pct:g}M bu/h</text>',
         f'<text x="{left}" y="149">Field moisture U({config.moisture_min_pct:g}%, {config.moisture_max_pct:g}%), seed {config.random_seed} | '
-        f'Trips use 5, 15, or 20 min outbound + {config.semi_unload_time_h * 60:g} min unload + equal return time</text>',
-        f'<text x="{left}" y="186">Harvest schedule from t=0: {config.harvest_work_window_h:g} h active + '
-        f'{config.harvest_rest_window_h:g} h scheduled rest; downstream continues during rest</text>',
+        f'Trips use 5, 15, or 20 min outbound + {config.semi_unload_time_h * 60:g} min nominal full-load unload '
+        f'(longer under backpressure) + equal return time</text>',
+        f'<text x="{left}" y="186">Harvest schedule: {config.harvest_work_window_h:g} h active + '
+        f'{config.harvest_rest_window_h:g} h rest | Adaptive interior forecast: '
+        f'{config.interior_prediction_horizon_h:g} h minimum</text>',
     ]
 
     def x(time_h: float) -> float:
@@ -132,7 +134,10 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
 
     panel(4, "Wet bin (bu)", config.wet_bin_capacity_bu)
     line(4, "wet_bin_inventory_bu", config.wet_bin_capacity_bu, "#0891b2", 3.0)
-    legend(4, [("FIFO wet-bin inventory", "#0891b2")])
+    line(4, "rest_dryer_inventory_target_bu", config.wet_bin_capacity_bu,
+         "#f59e0b", 1.5)
+    legend(4, [("FIFO wet-bin inventory", "#0891b2"),
+               ("10 h dryer minimum", "#f59e0b")])
 
     dryer_max = config.dryer_rate_for_moisture(config.moisture_min_pct)
     panel(5, "Dryer rate (bu/h)", dryer_max)

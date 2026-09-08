@@ -1,6 +1,6 @@
 # Harvest Coordinate Simulator
 
-离散事件收获协调模拟器：收获端可采用 1C、2C 或 2C+1GC，一辆半挂车连接接收坑、grain leg、wet bin 和 dryer。模型比较固定高强度作业与“田块选择 + Interior模式控制”的预测式 Adaptive。
+离散事件收获协调模拟器：收获端可采用 1C、2C 或 2C+1GC，一辆半挂车连接接收坑、grain leg、wet bin 和 dryer。模型比较固定高强度Sequential、只看当前压力的Reactive，以及“田块选择 + Interior模式控制”的预测式Adaptive。
 
 ## 运行
 
@@ -8,12 +8,13 @@
 
 ```bash
 python3 run_baseline.py --policy sequential
+python3 run_baseline.py --policy reactive
 python3 run_baseline.py --policy adaptive
 python3 run_experiments.py
 python3 -m unittest discover -s tests -v
 ```
 
-只使用 Python 标准库。收割从 `t=0` 开始，每个24小时周期运行14小时、计划停工10小时；停工期间semi、grain leg和dryer继续工作。结果按 `sequential/` 和 `adaptive/` 分目录：
+只使用 Python 标准库。收割从 `t=0` 开始，每个24小时周期运行14小时、计划停工10小时；停工期间semi、grain leg和dryer继续工作。结果按 `sequential/`、`reactive/` 和 `adaptive/` 分目录：
 
 - `metrics.json`：汇总指标；
 - `timeseries.csv`：每个时间步和事件边界的库存与状态；
@@ -22,7 +23,7 @@ python3 -m unittest discover -s tests -v
 - `overview.svg`：完整仿真图；
 - `first_3h.svg`：前三小时细节图；
 - `field_scenario.csv`：所有策略共用的田块面积、形状、距离、moisture 和 dryer rate；
-- `policy_comparison.csv`：两种策略的汇总对比。
+- `policy_comparison.csv`：三种策略的汇总对比。
 - `machine_hours_summary.csv`：两种策略的全季设备小时汇总。
 - `daily_machine_hours_comparison.csv`：两种策略逐日设备小时的合并对比。
 
@@ -32,6 +33,7 @@ python3 -m unittest discover -s tests -v
 
 ```bash
 python3 run_baseline.py --policy sequential --output-dir results/harvest_schedule_14h_on_10h_off
+python3 run_baseline.py --policy reactive --output-dir results/harvest_schedule_14h_on_10h_off
 python3 run_baseline.py --policy adaptive --output-dir results/harvest_schedule_14h_on_10h_off
 python3 run_experiments.py --output-dir results/harvest_schedule_14h_on_10h_off
 ```
@@ -54,6 +56,9 @@ python3 run_baseline.py --policy adaptive \
   --interior-2c-1gc-rate 5000 \
   --mode-dwell-min 30 \
   --max-mode-switches 2 \
+  --prediction-horizon-h 12 \
+  --rest-shortage-weight 1 \
+  --rest-coverage-transport-fraction 0.65 \
   --harvest-work-h 14 \
   --harvest-rest-h 10 \
   --name-suffix trial
@@ -101,14 +106,14 @@ Opening 固定采用2C，但使用独立于Interior 2C的有效能力；当前�
 | Combine tank | 500 bu | 联合收割机粮箱容量 |
 | Semi count | 1 | 半挂车数量 |
 | Semi capacity | 1000 bu | 单车容量 |
-| Semi unload time | 10 min | 半挂车卸入接收坑的固定时间 |
+| Semi nominal unload time | 10 min/full load | 满载 1,000 bu 对应 6,000 bu/h；回压可能延长 |
 | Receiving pit | 1000 bu | 一车容量的站内接收坑 |
 | Grain leg | 3000 bu/h | 从接收坑送入 wet bin 的最大速度 |
 | Wet bin | 10000 bu | dryer 之前的湿粮仓容量 |
 | Field moisture | U(18%, 22%) | 每个田初始化采样一次，场景内固定 |
 | Dryer throughput | `D(M)=2600-100M` | 由 FIFO 队首粮食的 moisture 决定 |
 
-半挂车完整周期是：
+无下游回压时，满载半挂车的名义完整周期是：
 
 ```text
 5 min field:  5 去程 + 10 卸货 +  5 返程 = 20 min
@@ -122,13 +127,15 @@ Opening 固定采用2C，但使用独立于Interior 2C的有效能力；当前�
 combine tank -> semi -> receiving pit -> grain leg -> wet bin -> dryer
 ```
 
-半挂车到站后，只有接收坑能够容纳整车粮食时才能开始固定 10 分钟卸货。Grain leg 是 wet bin 的输入设备，以最高 3000 bu/h 连续搬运。从田 `F_i` 产生的每个 grain batch 都继承该田固定的 `M_i`。Wet bin 保存有序的 `(quantity, moisture, field_id)` batch 队列并严格 FIFO；dryer 永远处理队首 batch，当前速度为 `D(M_head)=2600-100M_head`。因此 18%、19%、20%、21%、22% 分别对应 800、700、600、500、400 bu/h。
+半挂车到站且卸粮位可用时立即开始连续卸粮，满载名义卸速为 `1000 bu / 10 min = 6000 bu/h`，不再要求接收坑预先腾出整车空间。卸粮、grain leg 搬运和 dryer 处理同时发生；pit 满时，半挂车卸速被限制为 grain leg 的实际出流速度，无法出流时则暂停，只有车辆粮箱清空后才返田。Grain leg 是 wet bin 的输入设备，以最高 3000 bu/h 连续搬运。从田 `F_i` 产生的每个 grain batch 都继承该田固定的 `M_i`。Wet bin 保存有序的 `(quantity, moisture, field_id)` batch 队列并严格 FIFO；dryer 永远处理队首 batch，当前速度为 `D(M_head)=2600-100M_head`。因此 18%、19%、20%、21%、22% 分别对应 800、700、600、500、400 bu/h。
 
 Wet bin 满时，grain leg 最多只能补入 dryer 同时排出的数量；接收坑随后可能装满，半挂车会在粮站等待，田间失去可用车辆后，combine tank 满载并进入 `BLOCKED`。因此 wet bin 和 dryer 会真实地向上游产生回压，而不是无限库存。
 
-## Sequential 与 Adaptive
+## Sequential、Reactive 与 Adaptive
 
 Sequential 始终按 F1 → F2 → F3 → F4 → F5 → F6 → F7 → F8 → F9 → F10 作业；Opening固定2C，Interior固定使用最快的2C+1GC（5000 bu/h）。
+
+Reactive保持与Sequential相同的田块顺序，不使用未来预测，也不使用夜间库存目标。Opening仍固定2C；Interior根据当前压力即时选mode。即时压力取田间移动储粮压力、全系统库存占用率和wet-bin占用率三者的最大值：低于40%使用2C+1GC，40%–80%使用2C，达到80%使用1C。Reactive与Adaptive一样遵守每田最多2次mode切换和30分钟最短dwell，因此它是“只看当前状态”的公平对照组。
 
 Adaptive 只在一整块田完成后重新决策。每个候选田都预测到该田结束，估算：
 
@@ -138,9 +145,15 @@ Adaptive 只在一整块田完成后重新决策。每个候选田都预测到�
 - 当前 FIFO 队首粮食，以及候选田固定 moisture 对应的 dryer 能力；
 - 预计运输回压、dryer 回压和该田结束后留给后续田块的库存。
 
-预测得分最低的田先做。该计算是轻量确定性前瞻，而不是完整复制未来事件仿真；实际执行仍使用逐事件的物理模型。
+预测得分最低的田先做。这里的10分钟是无回压名义值；实际连续流仿真中，pit满载造成的卸粮延长仍会真实发生。该计算是轻量确定性前瞻，而不是完整复制未来事件仿真；实际执行仍使用逐事件的物理模型。
 
-进入Interior后，Adaptive从 `{1C, 2C, 2C+1GC}` 选择mode。它把未来2小时内最多10,000 bu作为相同工作量，分别估计各mode的生产时间、田间运输溢出、wet-bin/dryer溢出和forced blocking；得分接近时优先选择预测堵塞更少的mode。这形成 `predictive intentional slowdown`，而不是等wet bin满后被迫停机。
+进入Interior后，Adaptive从 `{1C, 2C, 2C+1GC}` 选择mode。预测窗口默认12小时，而且配置不允许低于12小时。三个候选mode使用相同预测工作量：`min(当前田剩余粮量, 5000 × horizon)`；在默认田块中，这会覆盖当前Interior的全部剩余粮量。算法分别估计生产时间、田间运输溢出、wet-bin/dryer溢出和forced blocking。
+
+当距离下一次计划停工不超过预测窗口时，Adaptive还会计算夜间目标库存。若队列内只有一种moisture，则`Q_target = min(wet-bin capacity, D(M_head) × rest hours)`；默认10小时停工时，500、600、700、800 bu/h的dryer目标分别为5,000、6,000、7,000、8,000 bu，而不是一律追求装满10,000 bu。若FIFO内含有多种moisture，算法会沿batch顺序逐批切换`D(M_head)`，直接算出未来10小时可处理的总量。
+
+这个量是**最低供粮保障**，不是“夜间结束时清空”的期末库存目标。它同时进入田块选择和Interior mode评分，但只惩罚预计不足；超过目标不会触发主动停收，也不会因为剩余粮食而受到该目标的惩罚。原有的完成时间和下游回压评分仍负责避免不必要的过量库存。
+
+夜间覆盖预测只按名义运输能力的65%计入预计可达wet bin的粮食，避免把仍在combine、semi或运输途中的粮食过早当成dryer库存。该保守系数可由`--rest-coverage-transport-fraction`调整。默认目标是保证dryer在每个完整10小时停工窗口持续运行。
 
 同一块田Interior内最多切换2次，因此最多3个operating segments；每个mode至少保持30分钟后才能再次切换。田块未完成时不能换田，但允许在Interior内部重新判断生产强度。整体决策结构为：
 
@@ -166,7 +179,7 @@ harvested grain
   + dried grain
 ```
 
-车辆到站不会直接清空成“消失”：粮食保留在车上直到 10 分钟卸货完成，然后批量进入接收坑；之后以 grain leg 和 dryer 的连续速率逐级转移。
+车辆到站不会直接清空成“消失”：粮食以最高 6000 bu/h 从车上连续进入接收坑，并与 grain leg 和 dryer 的连续流同步；接收坑或 wet bin 的回压会让卸粮变慢，车辆清空后才返田。
 
 ## 默认结果含义
 
@@ -180,11 +193,17 @@ harvested grain
 - `interior_*_productive_h`：三个Interior mode各自的有效生产时间；
 - `post_harvest_time_h`：收割完成后继续运输与烘干的时间；
 - `scheduled_harvest_rest_time_h`：收割完成前累计的计划停工时间；
+- `mean_wet_bin_inventory_at_rest_start_bu`：各次计划停工开始时的平均wet-bin库存；
+- `mean_rest_dryer_inventory_target_bu`：按当时FIFO队首dryer速度计算的平均10小时目标库存；
+- `mean_rest_inventory_target_shortfall_bu`：停工开始时相对10小时最低保障量的平均缺口；
+- `mean_rest_inventory_target_excess_bu`：超过最低保障量的平均库存，只作诊断、不进入夜间保障惩罚；
+- `mean_wet_bin_inventory_at_rest_end_bu`：10小时停工结束时的平均剩余wet-bin库存；
+- `dryer_idle_time_during_sampled_rests_h` 和 `dryer_utilization_during_sampled_rests`：完整停工窗口内dryer断粮时间与利用率；
 - `*_active_machine_h`：实际收割、换田、驾驶或卸粮的设备小时；
 - `*_occupied_machine_h`：active小时加上blocked、GC等待或田间待命小时；
 - `maximum_receiving_pit_inventory_bu` 和 `maximum_wet_bin_inventory_bu`：容量约束检查；
 - `mass_balance_error_bu`：最终粮食守恒误差。
 
-自动测试覆盖三种运输周期、10分钟卸货、grain leg速度、湿粮仓回压、14小时收割/10小时停工边界、停工期间下游继续运行、seed可复现且策略间共享的field moisture、FIFO连续速率切换、Opening独立2C能力、三种Interior有效能力、每田最多2次mode切换、30分钟dwell、整田约束、自适应前瞻、逐时刻粮食守恒和所有容量上限。
+自动测试覆盖三种运输周期、连续卸粮、pit回压限速、grain leg速度、湿粮仓回压、14小时收割/10小时停工边界、停工期间下游继续运行、seed可复现且策略间共享的field moisture、FIFO连续速率切换、FIFO-aware夜间最低供粮保障、Opening独立2C能力、三种Interior有效能力、至少12小时预测窗口、每田最多2次mode切换、30分钟dwell、整田约束、自适应前瞻、逐时刻粮食守恒和所有容量上限。
 
 Machine-hours按资源数量加权：Opening、2C和2C+1GC中的1小时分别计2个C-hours，1C中的1小时计1个C-hour，2C+1GC另计1个GC-hour。`BLOCKED`不计active但计occupied；field switching按两台combine移动计active。Semi的去程/返程与卸粮计active，GC等待和收割班次内的田间待命只计occupied；计划停工后空车停在田间不计occupied。Dryer与grain leg未包含在本设备小时汇总中。

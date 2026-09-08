@@ -7,6 +7,7 @@ MODE_1C = "1C"
 MODE_2C = "2C"
 MODE_2C_1GC = "2C+1GC"
 INTERIOR_MODES = (MODE_1C, MODE_2C, MODE_2C_1GC)
+MIN_INTERIOR_PREDICTION_HORIZON_H = 12.0
 
 
 @dataclass(frozen=True)
@@ -51,8 +52,10 @@ class SimulationConfig:
     max_interior_mode_switches: int = 2
     minimum_interior_mode_dwell_h: float = 30.0 / 60.0
     interior_mode_switch_time_h: float = 0.0
-    interior_prediction_horizon_h: float = 2.0
+    interior_prediction_horizon_h: float = MIN_INTERIOR_PREDICTION_HORIZON_H
     predictive_blocking_penalty: float = 0.05
+    rest_inventory_shortage_weight: float = 1.0
+    rest_coverage_transport_fraction: float = 0.65
     harvest_work_window_h: float = 14.0
     harvest_rest_window_h: float = 10.0
     header_width_ft: float = 30.0
@@ -64,7 +67,8 @@ class SimulationConfig:
     semi_capacity_bu: float = 1000.0
     semi_unload_time_h: float = 10.0 / 60.0
 
-    # A one-truck receiving pit decouples fixed unloading time from the grain leg.
+    # The pit is a finite buffer. Semi unloading, grain-leg transfer, and drying
+    # occur concurrently; downstream backpressure may extend unloading time.
     receiving_pit_capacity_bu: float = 1000.0
     grain_leg_rate_buph: float = 3000.0
     wet_bin_capacity_bu: float = 10000.0
@@ -112,6 +116,18 @@ class SimulationConfig:
         if (not isfinite(self.predictive_blocking_penalty)
                 or self.predictive_blocking_penalty < 0):
             raise ValueError("predictive_blocking_penalty must be finite and nonnegative")
+        if (not isfinite(self.rest_inventory_shortage_weight)
+                or self.rest_inventory_shortage_weight < 0):
+            raise ValueError("rest_inventory_shortage_weight must be finite and nonnegative")
+        if (not isfinite(self.rest_coverage_transport_fraction)
+                or not 0 < self.rest_coverage_transport_fraction <= 1):
+            raise ValueError(
+                "rest_coverage_transport_fraction must be in (0, 1]")
+        if self.interior_prediction_horizon_h < MIN_INTERIOR_PREDICTION_HORIZON_H:
+            raise ValueError(
+                "interior_prediction_horizon_h must be at least "
+                f"{MIN_INTERIOR_PREDICTION_HORIZON_H:g} hours"
+            )
         if (not isfinite(self.harvest_rest_window_h)
                 or self.harvest_rest_window_h < 0):
             raise ValueError("harvest_rest_window_h must be finite and nonnegative")
@@ -132,8 +148,6 @@ class SimulationConfig:
             raise ValueError("moisture bounds must be finite and satisfy min < max")
         if self.dryer_rate_for_moisture(self.moisture_max_pct) <= 0:
             raise ValueError("dryer throughput must remain positive over the moisture range")
-        if self.receiving_pit_capacity_bu + self.numerical_tolerance < self.semi_capacity_bu:
-            raise ValueError("receiving pit must hold at least one full semi")
         if not 0 <= self.low_receiving_pressure_fraction < self.high_receiving_pressure_fraction <= 1:
             raise ValueError("Receiving pressure thresholds must satisfy 0 <= low < high <= 1")
         ids = [field.field_id for field in self.field_specs]
@@ -165,6 +179,13 @@ class SimulationConfig:
         """Linear calibration: D(M) = intercept - slope * M."""
         return (self.dryer_intercept_buph
                 - self.dryer_moisture_slope_buph_per_pct * moisture_pct)
+
+    def rest_dryer_inventory_target_bu(self, dryer_rate_buph: float) -> float:
+        """Wet-bin inventory that lets the active dryer run through one rest."""
+        if dryer_rate_buph <= self.numerical_tolerance:
+            return 0.0
+        return min(self.wet_bin_capacity_bu,
+                   dryer_rate_buph * self.harvest_rest_window_h)
 
     def opening_rate_buph(self, geometry: str) -> float:
         return (self.rectangular_opening_2c_rate_buph

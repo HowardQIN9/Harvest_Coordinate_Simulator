@@ -13,7 +13,9 @@ from harvest_sim.plotting import plot_result
 def main() -> None:
     defaults = SimulationConfig()
     parser = argparse.ArgumentParser(description="Run one harvest/downstream simulation")
-    parser.add_argument("--policy", choices=["sequential", "adaptive"], default="sequential")
+    parser.add_argument(
+        "--policy", choices=["sequential", "reactive", "adaptive"],
+        default="sequential")
     parser.add_argument("--grain-leg-rate", type=float, default=defaults.grain_leg_rate_buph)
     parser.add_argument("--wet-bin-capacity", type=float, default=defaults.wet_bin_capacity_bu)
     parser.add_argument("--seed", type=int, default=defaults.random_seed)
@@ -38,6 +40,12 @@ def main() -> None:
                         default=defaults.max_interior_mode_switches)
     parser.add_argument("--mode-switch-time-min", type=float,
                         default=defaults.interior_mode_switch_time_h * 60.0)
+    parser.add_argument("--prediction-horizon-h", type=float,
+                        default=defaults.interior_prediction_horizon_h)
+    parser.add_argument("--rest-shortage-weight", type=float,
+                        default=defaults.rest_inventory_shortage_weight)
+    parser.add_argument("--rest-coverage-transport-fraction", type=float,
+                        default=defaults.rest_coverage_transport_fraction)
     parser.add_argument("--harvest-work-h", type=float,
                         default=defaults.harvest_work_window_h)
     parser.add_argument("--harvest-rest-h", type=float,
@@ -63,6 +71,9 @@ def main() -> None:
         minimum_interior_mode_dwell_h=args.mode_dwell_min / 60.0,
         max_interior_mode_switches=args.max_mode_switches,
         interior_mode_switch_time_h=args.mode_switch_time_min / 60.0,
+        interior_prediction_horizon_h=args.prediction_horizon_h,
+        rest_inventory_shortage_weight=args.rest_shortage_weight,
+        rest_coverage_transport_fraction=args.rest_coverage_transport_fraction,
         harvest_work_window_h=args.harvest_work_h,
         harvest_rest_window_h=args.harvest_rest_h,
     )
@@ -72,7 +83,9 @@ def main() -> None:
     scenario = (f"fields{len(config.field_specs)}_seed{config.random_seed}"
                 f"_moisture{config.moisture_min_pct:g}-{config.moisture_max_pct:g}"
                 f"_wetbin{args.wet_bin_capacity:g}_leg{args.grain_leg_rate:g}"
-                f"_harvest{args.harvest_work_h:g}h_rest{args.harvest_rest_h:g}h")
+                f"_harvest{args.harvest_work_h:g}h_rest{args.harvest_rest_h:g}h"
+                f"_forecast{args.prediction_horizon_h:g}h"
+                f"_restcoverage{args.rest_shortage_weight:g}")
     if suffix:
         scenario += f"_{suffix}"
     scenario_dir = args.output_dir / scenario

@@ -17,10 +17,19 @@ def main() -> None:
                         default=defaults.harvest_work_window_h)
     parser.add_argument("--harvest-rest-h", type=float,
                         default=defaults.harvest_rest_window_h)
+    parser.add_argument("--prediction-horizon-h", type=float,
+                        default=defaults.interior_prediction_horizon_h)
+    parser.add_argument("--rest-shortage-weight", type=float,
+                        default=defaults.rest_inventory_shortage_weight)
+    parser.add_argument("--rest-coverage-transport-fraction", type=float,
+                        default=defaults.rest_coverage_transport_fraction)
     args = parser.parse_args()
     config = SimulationConfig(
         harvest_work_window_h=args.harvest_work_h,
         harvest_rest_window_h=args.harvest_rest_h,
+        interior_prediction_horizon_h=args.prediction_horizon_h,
+        rest_inventory_shortage_weight=args.rest_shortage_weight,
+        rest_coverage_transport_fraction=args.rest_coverage_transport_fraction,
     )
     field_moistures = config.sample_field_moistures()
     scenario = (f"fields{len(config.field_specs)}_seed{config.random_seed}"
@@ -28,11 +37,13 @@ def main() -> None:
                 f"_wetbin{config.wet_bin_capacity_bu:g}"
                 f"_leg{config.grain_leg_rate_buph:g}"
                 f"_harvest{config.harvest_work_window_h:g}h"
-                f"_rest{config.harvest_rest_window_h:g}h")
+                f"_rest{config.harvest_rest_window_h:g}h"
+                f"_forecast{config.interior_prediction_horizon_h:g}h"
+                f"_restcoverage{config.rest_inventory_shortage_weight:g}")
     output = args.output_dir / scenario
     output.mkdir(parents=True, exist_ok=True)
     results = [Simulator(config, policy, field_moistures).run()
-               for policy in ("sequential", "adaptive")]
+               for policy in ("sequential", "reactive", "adaptive")]
     rows = [result.metrics for result in results]
 
     with (output / "field_scenario.csv").open(
@@ -105,6 +116,13 @@ def main() -> None:
         "total_active_machine_h", "total_occupied_machine_h",
         "intentional_slowdown_productive_h", "number_of_interior_mode_switches",
         "interior_mode_sequence", "combine_utilization",
+        "mean_wet_bin_inventory_at_rest_start_bu",
+        "mean_rest_dryer_inventory_target_bu",
+        "mean_rest_inventory_target_shortfall_bu",
+        "mean_rest_inventory_target_excess_bu",
+        "mean_wet_bin_inventory_at_rest_end_bu",
+        "dryer_idle_time_during_sampled_rests_h",
+        "dryer_utilization_during_sampled_rests",
         "maximum_wet_bin_inventory_bu", "number_of_semi_trips",
     ]
     print("\t".join(keys))

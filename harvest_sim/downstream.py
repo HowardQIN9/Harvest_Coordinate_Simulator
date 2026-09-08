@@ -31,6 +31,8 @@ class Semi:
     route_travel_h: float = 0.0
     route_field_id: str = ""
     trips: int = 0
+    unload_initial_bu: float = 0.0
+    unload_manifest: list[GrainLot] = field(default_factory=list)
 
     @property
     def load_bu(self) -> float:
@@ -79,6 +81,7 @@ class Downstream:
         self.total_unloaded_bu = 0.0
         self.total_leg_transferred_bu = 0.0
         self.total_dried_bu = 0.0
+        self.total_dryer_operating_h = 0.0
         self.total_dried_moisture_bushel_pct = 0.0
         self.dried_by_field_bu: dict[str, float] = {}
         self.events: list[dict[str, Any]] = []
@@ -123,7 +126,10 @@ class Downstream:
 
     @property
     def current_dryer_rate_buph(self) -> float:
-        queue = self.wet_bin_lots or self.receiving_pit_lots
+        unloading = next((semi for semi in self.semis
+                          if semi.state == UNLOADING and semi.lots), None)
+        queue = (self.wet_bin_lots or self.receiving_pit_lots
+                 or (unloading.lots if unloading else []))
         if not queue:
             return 0.0
         return self.config.dryer_rate_for_moisture(queue[0].moisture_pct)
@@ -146,21 +152,102 @@ class Downstream:
     def _dryer_rate(self, moisture_pct: float) -> float:
         return self.config.dryer_rate_for_moisture(moisture_pct)
 
-    def _dry(self, amount_bu: float) -> None:
+    def dryer_inventory_target_bu(
+            self, horizon_h: float,
+            fallback_moisture_pct: float | None = None) -> float:
+        """FIFO-aware grain quantity the dryer can process over ``horizon_h``.
+
+        Lots already moving through the downstream system are followed in their
+        expected order. If they do not cover the horizon, newly harvested grain
+        is represented by the active field's fixed moisture.
+        """
+        remaining_h = max(0.0, horizon_h)
+        required_bu = 0.0
+        semis_in_expected_order = sorted(
+            self.semis,
+            key=lambda semi: min(semi.gc_arrival_h, semi.unload_complete_h,
+                                 semi.field_return_h),
+        )
+        queues = [self.wet_bin_lots, self.receiving_pit_lots]
+        queues.extend(semi.lots for semi in semis_in_expected_order)
+        queues.append(self.combine_lots)
+        for queue in queues:
+            for lot in queue:
+                if remaining_h <= self.config.numerical_tolerance:
+                    break
+                rate = self._dryer_rate(lot.moisture_pct)
+                amount = min(lot.amount_bu, rate * remaining_h)
+                required_bu += amount
+                remaining_h -= amount / rate
+            if remaining_h <= self.config.numerical_tolerance:
+                break
+        if (remaining_h > self.config.numerical_tolerance
+                and fallback_moisture_pct is not None):
+            required_bu += (
+                self._dryer_rate(fallback_moisture_pct) * remaining_h)
+        return min(self.config.wet_bin_capacity_bu, required_bu)
+
+    def _dry(self, amount_bu: float) -> float:
         if amount_bu <= self.config.numerical_tolerance:
-            return
+            return 0.0
         dried_lots: list[GrainLot] = []
         _move_lots(self.wet_bin_lots, dried_lots, amount_bu)
+        dried_bu = sum(lot.amount_bu for lot in dried_lots)
         for lot in dried_lots:
             self.total_dried_moisture_bushel_pct += lot.amount_bu * lot.moisture_pct
             self.dried_by_field_bu[lot.field_id] = (
                 self.dried_by_field_bu.get(lot.field_id, 0.0) + lot.amount_bu)
+        return dried_bu
+
+    def _flow_rates(self, unloading: Semi | None) -> tuple[float, float, float]:
+        """Return current semi-unload, grain-leg, and dryer flow rates."""
+        c = self.config
+        pit = self.receiving_pit_inventory_bu
+        wet = self.wet_bin_inventory_bu
+        head_queue = (self.wet_bin_lots or self.receiving_pit_lots
+                      or (unloading.lots if unloading else []))
+        dryer_rate = self._dryer_rate(head_queue[0].moisture_pct) if head_queue else 0.0
+        nominal_unload_rate = c.semi_capacity_bu / c.semi_unload_time_h
+        source_unload_rate = (
+            nominal_unload_rate
+            if unloading is not None and unloading.load_bu > c.numerical_tolerance
+            else 0.0
+        )
+
+        if wet < c.wet_bin_capacity_bu - c.numerical_tolerance:
+            leg_capacity = c.grain_leg_rate_buph
+        elif dryer_rate > 0:
+            # At a full wet bin the leg can replace only what the dryer removes.
+            leg_capacity = min(c.grain_leg_rate_buph, dryer_rate)
+        else:
+            leg_capacity = 0.0
+
+        if pit > c.numerical_tolerance:
+            leg_rate = leg_capacity
+        else:
+            # Grain may pass straight through an empty pit while the semi
+            # unloads; the leg cannot move faster than that incoming flow.
+            leg_rate = min(leg_capacity, source_unload_rate)
+
+        if pit < c.receiving_pit_capacity_bu - c.numerical_tolerance:
+            unload_rate = source_unload_rate
+        else:
+            # A full pit throttles the semi to exactly the rate at which the
+            # grain leg creates room. If that rate is zero, unloading pauses.
+            unload_rate = min(source_unload_rate, leg_rate)
+
+        active_dryer_rate = (
+            dryer_rate if wet > c.numerical_tolerance
+            else min(dryer_rate, leg_rate)
+        )
+        return unload_rate, leg_rate, active_dryer_rate
 
     def advance_time(self, duration_h: float) -> None:
         c = self.config
         if duration_h < 0 or self.time_h + duration_h > self.next_event_h + c.numerical_tolerance:
             raise ValueError("Split the interval at the next downstream event")
         remaining_h = duration_h
+        unloading = next((semi for semi in self.semis if semi.state == UNLOADING), None)
         iterations = 0
         while remaining_h > c.numerical_tolerance:
             iterations += 1
@@ -168,49 +255,65 @@ class Downstream:
                 raise RuntimeError("Continuous downstream flow did not converge")
             pit = self.receiving_pit_inventory_bu
             wet = self.wet_bin_inventory_bu
-            head_queue = self.wet_bin_lots or self.receiving_pit_lots
-            dryer_rate = self._dryer_rate(head_queue[0].moisture_pct) if head_queue else 0.0
-
-            if pit <= c.numerical_tolerance:
-                leg_rate = 0.0
-            elif wet < c.wet_bin_capacity_bu - c.numerical_tolerance:
-                leg_rate = c.grain_leg_rate_buph
-            elif dryer_rate > 0:
-                # At a full wet bin the leg can replace only what the dryer removes.
-                leg_rate = min(c.grain_leg_rate_buph, dryer_rate)
-            else:
-                leg_rate = 0.0
-
-            active_dryer_rate = dryer_rate if wet > c.numerical_tolerance else min(dryer_rate, leg_rate)
-            if leg_rate <= c.numerical_tolerance and active_dryer_rate <= c.numerical_tolerance:
+            unload_rate, leg_rate, active_dryer_rate = self._flow_rates(unloading)
+            if (unload_rate <= c.numerical_tolerance
+                    and leg_rate <= c.numerical_tolerance
+                    and active_dryer_rate <= c.numerical_tolerance):
                 break
 
             step = remaining_h
+            if (unload_rate > c.numerical_tolerance and unloading is not None
+                    and unloading.lots):
+                step = min(step, unloading.lots[0].amount_bu / unload_rate)
             if leg_rate > c.numerical_tolerance and self.receiving_pit_lots:
                 step = min(step, self.receiving_pit_lots[0].amount_bu / leg_rate)
             if active_dryer_rate > c.numerical_tolerance and self.wet_bin_lots:
                 step = min(step, self.wet_bin_lots[0].amount_bu / active_dryer_rate)
-            net_rate = leg_rate - active_dryer_rate
-            if net_rate > c.numerical_tolerance and wet < c.wet_bin_capacity_bu:
-                step = min(step, (c.wet_bin_capacity_bu - wet) / net_rate)
-            elif net_rate < -c.numerical_tolerance and wet > 0:
-                step = min(step, wet / -net_rate)
+            pit_net_rate = unload_rate - leg_rate
+            if (pit_net_rate > c.numerical_tolerance
+                    and pit < c.receiving_pit_capacity_bu):
+                step = min(step, (c.receiving_pit_capacity_bu - pit) / pit_net_rate)
+            elif pit_net_rate < -c.numerical_tolerance and pit > 0:
+                step = min(step, pit / -pit_net_rate)
+            wet_net_rate = leg_rate - active_dryer_rate
+            if (wet_net_rate > c.numerical_tolerance
+                    and wet < c.wet_bin_capacity_bu):
+                step = min(step, (c.wet_bin_capacity_bu - wet) / wet_net_rate)
+            elif wet_net_rate < -c.numerical_tolerance and wet > 0:
+                step = min(step, wet / -wet_net_rate)
             if step <= c.numerical_tolerance:
                 step = min(remaining_h, c.numerical_tolerance)
 
+            unload_amount = unload_rate * step
             leg_amount = leg_rate * step
             dry_amount = active_dryer_rate * step
-            if wet >= c.wet_bin_capacity_bu - c.numerical_tolerance:
-                self._dry(dry_amount)
-                _move_lots(self.receiving_pit_lots, self.wet_bin_lots, leg_amount)
-            else:
-                _move_lots(self.receiving_pit_lots, self.wet_bin_lots, leg_amount)
-                self._dry(dry_amount)
-            self.total_leg_transferred_bu += leg_amount
-            self.total_dried_bu += dry_amount
+            # Upstream-to-downstream ordering permits continuous pass-through
+            # when a buffer starts empty. Temporary within-step overfill is
+            # removed by the simultaneous downstream flow before state is read.
+            if unloading is not None:
+                moved = _move_lots(
+                    unloading.lots, self.receiving_pit_lots, unload_amount)
+                self.total_unloaded_bu += sum(lot.amount_bu for lot in moved)
+            moved = _move_lots(
+                self.receiving_pit_lots, self.wet_bin_lots, leg_amount)
+            self.total_leg_transferred_bu += sum(lot.amount_bu for lot in moved)
+            dried_bu = self._dry(dry_amount)
+            self.total_dried_bu += dried_bu
+            if active_dryer_rate > c.numerical_tolerance:
+                self.total_dryer_operating_h += step
             remaining_h -= step
 
         self.time_h += duration_h
+        if unloading is not None:
+            if unloading.load_bu <= c.numerical_tolerance:
+                unloading.lots.clear()
+                unloading.unload_complete_h = self.time_h
+            else:
+                current_unload_rate, _, _ = self._flow_rates(unloading)
+                unloading.unload_complete_h = (
+                    self.time_h + unloading.load_bu / current_unload_rate
+                    if current_unload_rate > c.numerical_tolerance else inf
+                )
 
     def _moisture_label(self, lots: list[GrainLot]) -> str:
         values = sorted({lot.moisture_pct for lot in lots})
@@ -247,15 +350,22 @@ class Downstream:
         c = self.config
         if any(semi.state == UNLOADING for semi in self.semis):
             return
-        free_pit = c.receiving_pit_capacity_bu - self.receiving_pit_inventory_bu
         waiting = sorted((semi for semi in self.semis if semi.state == WAITING_UNLOAD),
                          key=lambda semi: (semi.gc_arrival_h, semi.semi_id))
-        for semi in waiting:
-            if semi.load_bu <= free_pit + c.numerical_tolerance:
-                semi.state = UNLOADING
-                semi.unload_complete_h = self.time_h + c.semi_unload_time_h
-                self._event("START_UNLOAD", semi, semi.load_bu)
-                break
+        if waiting:
+            semi = waiting[0]
+            semi.state = UNLOADING
+            semi.unload_initial_bu = semi.load_bu
+            semi.unload_manifest = [
+                GrainLot(lot.amount_bu, lot.moisture_pct, lot.field_id)
+                for lot in semi.lots
+            ]
+            current_rate, _, _ = self._flow_rates(semi)
+            semi.unload_complete_h = (
+                self.time_h + semi.load_bu / current_rate
+                if current_rate > c.numerical_tolerance else inf
+            )
+            self._event("START_UNLOAD", semi, semi.load_bu)
 
     def handle_events(self) -> None:
         c = self.config
@@ -266,16 +376,16 @@ class Downstream:
                 semi.gc_arrival_h = inf
                 self._event("ARRIVE_GC", semi, semi.load_bu)
         for semi in self.semis:
-            if semi.state == UNLOADING and semi.unload_complete_h <= self.time_h + tolerance:
-                grain = semi.load_bu
-                lots = [GrainLot(lot.amount_bu, lot.moisture_pct, lot.field_id)
-                        for lot in semi.lots]
-                _move_lots(semi.lots, self.receiving_pit_lots, grain)
-                self.total_unloaded_bu += grain
-                self._event("FINISH_UNLOAD", semi, grain, lots)
+            if (semi.state == UNLOADING
+                    and semi.load_bu <= tolerance
+                    and semi.unload_complete_h <= self.time_h + tolerance):
+                self._event("FINISH_UNLOAD", semi, semi.unload_initial_bu,
+                            semi.unload_manifest)
                 semi.state = RETURNING
                 semi.unload_complete_h = inf
                 semi.field_return_h = self.time_h + semi.route_travel_h
+                semi.unload_initial_bu = 0.0
+                semi.unload_manifest = []
         for semi in self.semis:
             if semi.state == RETURNING and semi.field_return_h <= self.time_h + tolerance:
                 semi.state = AT_FIELD
@@ -332,6 +442,7 @@ class Downstream:
             "cumulative_grain_unloaded_bu": self.total_unloaded_bu,
             "cumulative_grain_to_wet_bin_bu": self.total_leg_transferred_bu,
             "cumulative_grain_dried_bu": self.total_dried_bu,
+            "cumulative_dryer_operating_h": self.total_dryer_operating_h,
             "cumulative_dried_average_moisture_pct": (
                 self.total_dried_moisture_bushel_pct / self.total_dried_bu
                 if self.total_dried_bu > self.config.numerical_tolerance else 0.0),

@@ -7,7 +7,8 @@ from typing import Any
 from .accounting import calculate_daily_machine_hours, summarize_machine_hours
 from .config import (INTERIOR_MODES, MODE_2C, MODE_2C_1GC,
                      SimulationConfig)
-from .controller import AdaptiveController, SequentialController, TaskRef
+from .controller import (AdaptiveController, ReactiveController,
+                         SequentialController, TaskRef)
 from .downstream import AT_FIELD, Downstream
 from .field import INTERIOR, Field
 
@@ -39,6 +40,8 @@ class Simulator:
         self.downstream = Downstream(config)
         if policy == "sequential":
             self.controller = SequentialController()
+        elif policy == "reactive":
+            self.controller = ReactiveController(config)
         elif policy == "adaptive":
             self.controller = AdaptiveController(config)
         else:
@@ -147,6 +150,13 @@ class Simulator:
                 elif active[1] != INTERIOR:
                     active_mode = "Opening-2C"
                     active_rate_buph = c.opening_rate_buph(active_field.geometry)
+            downstream_snapshot = d.snapshot()
+            fallback_moisture_pct = (
+                self.fields[active[0]].moisture_pct if active else None)
+            rest_inventory_target_bu = d.dryer_inventory_target_bu(
+                c.harvest_rest_window_h, fallback_moisture_pct)
+            harvesting_open, hours_to_boundary_h = harvest_window()
+            hours_to_rest_h = hours_to_boundary_h if harvesting_open else 0.0
             series.append({
                 "time_h": d.time_h,
                 "duration_h": duration_h,
@@ -161,9 +171,13 @@ class Simulator:
                                            if active else ""),
                 "combine_state": state,
                 "event": event,
+                "hours_to_harvest_rest_h": hours_to_rest_h,
+                "rest_dryer_inventory_target_bu": rest_inventory_target_bu,
+                "rest_dryer_inventory_target_gap_bu": (
+                    rest_inventory_target_bu - d.wet_bin_inventory_bu),
                 "cumulative_harvested_ac": harvested_ac,
                 "cumulative_grain_generated_bu": generated_bu,
-                **d.snapshot(),
+                **downstream_snapshot,
             })
 
         record("IDLE", None)
@@ -258,6 +272,12 @@ class Simulator:
                     field_mobile_free_bu=field_mobile_free_bu(),
                     system_buffer_free_bu=system_buffer_free_bu(),
                     current_dryer_rate_buph=d.current_dryer_rate_buph,
+                    wet_bin_inventory_bu=d.wet_bin_inventory_bu,
+                    hours_to_harvest_rest_h=window_remaining_h,
+                    rest_inventory_target_bu=d.dryer_inventory_target_bu(
+                        c.harvest_rest_window_h,
+                        (self.fields[current[0]].moisture_pct
+                         if current else None)),
                 )
             if choice is None:
                 raise AssertionError("Unfinished fields have no available task")
@@ -274,10 +294,12 @@ class Simulator:
                 begin_field(combine_field)
 
             field = self.fields[current[0]]
+            rest_inventory_target_bu = d.dryer_inventory_target_bu(
+                c.harvest_rest_window_h, field.moisture_pct)
             if current[1] == INTERIOR:
                 may_choose_mode = (
                     current_interior_mode is None
-                    or (self.controller.name == "adaptive"
+                    or (self.controller.allows_interior_mode_switching
                         and field_interior_mode_switches < c.max_interior_mode_switches
                         and interior_mode_dwell_h + c.numerical_tolerance
                         >= c.minimum_interior_mode_dwell_h)
@@ -286,12 +308,16 @@ class Simulator:
                     proposed_mode = self.controller.choose_interior_mode(
                         remaining_grain_bu=(field.interior_remaining_ac
                                             * c.yield_bu_per_ac),
+                        receiving_pressure=d.receiving_pressure,
                         field_mobile_free_bu=field_mobile_free_bu(),
                         system_buffer_free_bu=system_buffer_free_bu(),
                         transport_rate_buph=transport_rate_buph(field),
                         active_dryer_rate_buph=(d.current_dryer_rate_buph
                                                 or c.dryer_rate_for_moisture(
                                                     field.moisture_pct)),
+                        wet_bin_inventory_bu=d.wet_bin_inventory_bu,
+                        hours_to_harvest_rest_h=window_remaining_h,
+                        rest_inventory_target_bu=rest_inventory_target_bu,
                     )
                     if current_interior_mode is None:
                         current_interior_mode = proposed_mode
@@ -363,6 +389,60 @@ class Simulator:
             field.total_area_ac * c.yield_bu_per_ac * field.moisture_pct
             for field in self.fields
         ) / c.total_grain_bu
+        rest_start_samples: list[dict[str, Any]] = []
+        rest_end_samples: list[dict[str, Any]] = []
+        if c.harvest_rest_window_h > c.numerical_tolerance:
+            cycle_h = c.harvest_work_window_h + c.harvest_rest_window_h
+            rest_start_h = c.harvest_work_window_h
+            while rest_start_h < harvest_completion_h - c.numerical_tolerance:
+                row = min(series, key=lambda item: abs(item["time_h"] - rest_start_h))
+                if abs(row["time_h"] - rest_start_h) <= c.dt_h + c.numerical_tolerance:
+                    rest_start_samples.append(row)
+                rest_end_h = rest_start_h + c.harvest_rest_window_h
+                end_row = min(series,
+                              key=lambda item: abs(item["time_h"] - rest_end_h))
+                if abs(end_row["time_h"] - rest_end_h) <= (
+                        c.dt_h + c.numerical_tolerance):
+                    rest_end_samples.append(end_row)
+                rest_start_h += cycle_h
+        rest_start_count = len(rest_start_samples)
+        mean_rest_start_wet_bin_bu = (
+            sum(row["wet_bin_inventory_bu"] for row in rest_start_samples)
+            / rest_start_count if rest_start_count else 0.0
+        )
+        mean_rest_target_bu = (
+            sum(row["rest_dryer_inventory_target_bu"] for row in rest_start_samples)
+            / rest_start_count if rest_start_count else 0.0
+        )
+        mean_abs_rest_target_error_bu = (
+            sum(abs(row["rest_dryer_inventory_target_gap_bu"])
+                for row in rest_start_samples) / rest_start_count
+            if rest_start_count else 0.0
+        )
+        mean_rest_target_shortfall_bu = (
+            sum(max(0.0, row["rest_dryer_inventory_target_gap_bu"])
+                for row in rest_start_samples) / rest_start_count
+            if rest_start_count else 0.0
+        )
+        mean_rest_target_excess_bu = (
+            sum(max(0.0, -row["rest_dryer_inventory_target_gap_bu"])
+                for row in rest_start_samples) / rest_start_count
+            if rest_start_count else 0.0
+        )
+        mean_rest_end_wet_bin_bu = (
+            sum(row["wet_bin_inventory_bu"] for row in rest_end_samples)
+            / len(rest_end_samples) if rest_end_samples else 0.0
+        )
+        total_rest_dryer_operating_h = sum(
+            end["cumulative_dryer_operating_h"]
+            - start["cumulative_dryer_operating_h"]
+            for start, end in zip(rest_start_samples, rest_end_samples)
+        )
+        total_sampled_rest_h = len(rest_end_samples) * c.harvest_rest_window_h
+        rest_dryer_utilization = (
+            total_rest_dryer_operating_h / total_sampled_rest_h
+            if total_sampled_rest_h > c.numerical_tolerance else 0.0
+        )
         metrics: dict[str, float | int | str] = {
             "policy": self.controller.name,
             "field_order": " -> ".join(field_order),
@@ -395,8 +475,22 @@ class Simulator:
             "minimum_interior_mode_dwell_min": c.minimum_interior_mode_dwell_h * 60.0,
             "maximum_interior_mode_switches_per_field": c.max_interior_mode_switches,
             "interior_mode_switch_time_min": c.interior_mode_switch_time_h * 60.0,
+            "interior_prediction_horizon_h": c.interior_prediction_horizon_h,
+            "rest_inventory_shortage_weight": c.rest_inventory_shortage_weight,
+            "rest_coverage_transport_fraction": c.rest_coverage_transport_fraction,
             "harvest_work_window_h": c.harvest_work_window_h,
             "harvest_rest_window_h": c.harvest_rest_window_h,
+            "number_of_rest_starts_before_harvest_completion": rest_start_count,
+            "mean_wet_bin_inventory_at_rest_start_bu": mean_rest_start_wet_bin_bu,
+            "mean_rest_dryer_inventory_target_bu": mean_rest_target_bu,
+            "mean_absolute_rest_inventory_target_error_bu": mean_abs_rest_target_error_bu,
+            "mean_rest_inventory_target_shortfall_bu": mean_rest_target_shortfall_bu,
+            "mean_rest_inventory_target_excess_bu": mean_rest_target_excess_bu,
+            "mean_wet_bin_inventory_at_rest_end_bu": mean_rest_end_wet_bin_bu,
+            "dryer_operating_time_during_sampled_rests_h": total_rest_dryer_operating_h,
+            "dryer_idle_time_during_sampled_rests_h": (
+                total_sampled_rest_h - total_rest_dryer_operating_h),
+            "dryer_utilization_during_sampled_rests": rest_dryer_utilization,
             "semi_unload_time_min": c.semi_unload_time_h * 60.0,
             "combine_tank_capacity_bu": c.combine_tank_capacity_bu,
             "semi_count": c.semi_count,
