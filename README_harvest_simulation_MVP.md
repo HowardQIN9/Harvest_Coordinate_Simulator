@@ -1,11 +1,11 @@
 # Harvest–Downstream Coordination Simulation MVP
 
 > **Historical design document.** The equivalent-buffer downstream model and its
-> buffer thresholds, output schema, and example rates below have been superseded.
-> The current implementation uses a 500-bu combine tank, one 1000-bu semi,
-> delivery at 20 minutes, empty return at 45 minutes, and continuous GC processing
-> at 1000 bu/h with unlimited GC inventory. See [README.md](README.md) for the
-> current model, assumptions, parameters, run commands, and completion metrics.
+> buffer thresholds, output schema, example rates, and task-ordering objective
+> below have been superseded. It is retained only to document the project's
+> earliest MVP. See [README.md](README.md) and
+> [autonomous_harvest_experiment_design.md](autonomous_harvest_experiment_design.md)
+> for the current model and frozen experiment design.
 
 ## 1. Goal
 

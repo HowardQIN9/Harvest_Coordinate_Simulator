@@ -1,45 +1,52 @@
 import unittest
 from dataclasses import replace
 
-from harvest_sim import (SimulationConfig, Simulator,
-                         calculate_daily_machine_hours,
-                         summarize_machine_hours)
-from harvest_sim.config import (INTERIOR_MODES,
-                                MIN_INTERIOR_PREDICTION_HORIZON_H,
-                                MODE_1C, MODE_2C, MODE_2C_1GC, FieldSpec)
-from harvest_sim.downstream import (
-    AT_FIELD,
-    RETURNING,
-    UNLOADING,
-    WAITING_UNLOAD,
-    Downstream,
-    GrainLot,
+from harvest_sim import (
+    MIN_PREDICTION_HORIZON_H,
+    MODE_1C,
+    MODE_2C,
+    MODE_2C_1GC,
+    FieldSpec,
+    SimulationConfig,
+    Simulator,
+    calculate_daily_machine_hours,
+    summarize_machine_hours,
 )
-from harvest_sim.controller import AdaptiveController, ReactiveController
+from harvest_sim.config import INTERIOR_MODES
+from harvest_sim.controller import (
+    HARVEST,
+    STOP,
+    ForecastLot,
+    ForecastSegment,
+    PredictiveController,
+    ReactiveController,
+    ThresholdController,
+)
+from harvest_sim.downstream import AT_FIELD, RETURNING, UNLOADING, Downstream, GrainLot
 from harvest_sim.field import INTERIOR, OPENING
 
 
 class DownstreamTests(unittest.TestCase):
-    def full_departure(self, downstream: Downstream,
-                       moisture_pct: float = 18.0) -> None:
-        for _ in range(2):
-            downstream.add_harvested_grain(500.0, moisture_pct, "F1")
-            downstream.unload_combine()
+    def dispatch_full_semi(self, downstream: Downstream) -> None:
+        downstream.add_harvested_grain(1000.0, 18.0, "F1")
+        downstream.unload_field_storage(600.0, False, force=True)
 
-    def test_five_plus_ten_plus_five_minute_trip(self):
+    def test_five_plus_twenty_plus_five_minute_trip_without_pit(self):
         d = Downstream(SimulationConfig())
         d.set_field_context("F1", 5.0)
-        self.full_departure(d)
+        self.dispatch_full_semi(d)
 
         d.advance_time(5 / 60)
         d.handle_events()
         self.assertEqual(d.semis[0].state, UNLOADING)
-        d.advance_time(10 / 60)
+        d.advance_time(20 / 60)
         d.handle_events()
         self.assertEqual(d.semis[0].state, RETURNING)
-        self.assertAlmostEqual(d.receiving_pit_inventory_bu, 500.0)
-        self.assertAlmostEqual(d.wet_bin_inventory_bu, 500.0 - 800.0 * 10 / 60)
+        self.assertEqual(d.receiving_pit_inventory_bu, 0.0)
         self.assertAlmostEqual(d.total_unloaded_bu, 1000.0)
+        self.assertAlmostEqual(d.total_dried_bu, 800.0 * 20 / 60)
+        self.assertAlmostEqual(
+            d.wet_bin_inventory_bu, 1000.0 - 800.0 * 20 / 60)
         d.advance_time(5 / 60)
         d.handle_events()
         self.assertEqual(d.semis[0].state, AT_FIELD)
@@ -48,16 +55,8 @@ class DownstreamTests(unittest.TestCase):
                  if event["event"] != "LOAD_SEMI"}
         self.assertAlmostEqual(times["ARRIVE_GC"], 5 / 60)
         self.assertAlmostEqual(times["START_UNLOAD"], 5 / 60)
-        self.assertAlmostEqual(times["FINISH_UNLOAD"], 15 / 60)
-        self.assertAlmostEqual(times["RETURN_FIELD"], 20 / 60)
-
-    def test_grain_leg_feeds_wet_bin_at_3000_buph(self):
-        d = Downstream(SimulationConfig())
-        d.receiving_pit_lots.append(GrainLot(1000.0, 18.0, "F1"))
-        d.advance_time(10 / 60)
-        self.assertAlmostEqual(d.total_leg_transferred_bu, 500.0)
-        self.assertAlmostEqual(d.total_dried_bu, 800.0 * 10 / 60)
-        self.assertAlmostEqual(d.wet_bin_inventory_bu, 500.0 - 800.0 * 10 / 60)
+        self.assertAlmostEqual(times["FINISH_UNLOAD"], 25 / 60)
+        self.assertAlmostEqual(times["RETURN_FIELD"], 30 / 60)
 
     def test_fifo_dryer_changes_rate_with_moisture(self):
         d = Downstream(SimulationConfig())
@@ -73,144 +72,50 @@ class DownstreamTests(unittest.TestCase):
         self.assertAlmostEqual(d.dried_by_field_bu["F2"], 100.0)
         self.assertAlmostEqual(d.wet_bin_inventory_bu, 0.0)
 
-    def test_full_downstream_throttles_continuous_unloading(self):
+    def test_full_wet_bin_throttles_direct_unloading_to_dryer_rate(self):
         d = Downstream(SimulationConfig())
-        d.receiving_pit_lots.append(GrainLot(1000.0, 22.0, "F1"))
-        d.wet_bin_lots.append(GrainLot(10000.0, 22.0, "F1"))
+        d.wet_bin_lots.append(GrainLot(10000.0, 22.0, "F0"))
         semi = d.semis[0]
         semi.lots.append(GrainLot(1000.0, 22.0, "F1"))
-        semi.state = WAITING_UNLOAD
+        semi.state = "WAITING_UNLOAD"
         semi.route_travel_h = 5 / 60
         d.handle_events()
         self.assertEqual(semi.state, UNLOADING)
+
         d.advance_time(1.0)
         d.handle_events()
         self.assertEqual(semi.state, UNLOADING)
         self.assertAlmostEqual(semi.load_bu, 600.0)
-        self.assertAlmostEqual(d.receiving_pit_inventory_bu, 1000.0)
         self.assertAlmostEqual(d.wet_bin_inventory_bu, 10000.0)
         d.advance_time(1.5)
         d.handle_events()
         self.assertEqual(semi.state, RETURNING)
         self.assertAlmostEqual(semi.load_bu, 0.0)
 
-    def test_half_full_pit_does_not_delay_nominal_unload(self):
-        d = Downstream(SimulationConfig())
-        d.receiving_pit_lots.append(GrainLot(500.0, 18.0, "F0"))
-        semi = d.semis[0]
-        semi.lots.append(GrainLot(1000.0, 18.0, "F1"))
-        semi.state = WAITING_UNLOAD
-        semi.route_travel_h = 5 / 60
-        d.handle_events()
-        self.assertEqual(semi.state, UNLOADING)
-        d.advance_time(10 / 60)
-        d.handle_events()
-        self.assertEqual(semi.state, RETURNING)
-        self.assertAlmostEqual(semi.load_bu, 0.0)
-        self.assertAlmostEqual(d.receiving_pit_inventory_bu, 1000.0)
-        self.assertLessEqual(d.wet_bin_inventory_bu, d.config.wet_bin_capacity_bu)
 
+class ControllerTests(unittest.TestCase):
+    def current_state(self, config: SimulationConfig, **updates):
+        state = {
+            "phase": INTERIOR,
+            "geometry": "rectangular",
+            "receiving_pressure": 0.0,
+            "field_mobile_free_bu": 4600.0,
+            "system_buffer_free_bu": 10000.0,
+            "wet_bin_inventory_bu": 0.0,
+            "wet_bin_free_bu": config.wet_bin_capacity_bu,
+            "committed_grain_bu": 0.0,
+            "transport_rate_buph": 5000.0,
+            "active_dryer_rate_buph": 800.0,
+            "protection_h": 1.0,
+        }
+        state.update(updates)
+        return state
 
-class SimulatorTests(unittest.TestCase):
-    def assert_mass_balance(self, result, config):
-        for row in result.time_series:
-            semi_grain = sum(row[f"semi_{index}_load_bu"]
-                             for index in range(1, config.semi_count + 1))
-            stored = (row["combine_tank_bu"] + semi_grain
-                      + row["receiving_pit_inventory_bu"]
-                      + row["wet_bin_inventory_bu"])
-            self.assertAlmostEqual(
-                row["cumulative_grain_generated_bu"],
-                row["cumulative_grain_dried_bu"] + stored,
-                places=5,
-            )
-            self.assertLessEqual(row["receiving_pit_inventory_bu"],
-                                 config.receiving_pit_capacity_bu + 1e-7)
-            self.assertLessEqual(row["wet_bin_inventory_bu"],
-                                 config.wet_bin_capacity_bu + 1e-6)
-
-    def test_default_field_table(self):
+    def test_static_threshold_is_a_separate_reference(self):
         c = SimulationConfig()
-        actual = [(f.field_id, f.area_ac, f.geometry,
-                   f.one_way_travel_min) for f in c.field_specs]
-        self.assertEqual(actual, [
-            ("F1", 50.0, "irregular", 5.0),
-            ("F2", 80.0, "rectangular", 15.0),
-            ("F3", 50.0, "irregular", 20.0),
-            ("F4", 80.0, "rectangular", 5.0),
-            ("F5", 50.0, "irregular", 15.0),
-            ("F6", 80.0, "rectangular", 20.0),
-            ("F7", 50.0, "irregular", 15.0),
-            ("F8", 80.0, "rectangular", 15.0),
-            ("F9", 50.0, "irregular", 15.0),
-            ("F10", 80.0, "rectangular", 15.0),
-        ])
-        added_fields = c.field_specs[6:]
-        self.assertEqual(sum(f.geometry == "rectangular" for f in added_fields), 2)
-        self.assertEqual(sum(f.geometry == "irregular" for f in added_fields), 2)
-        self.assertTrue(all(f.one_way_travel_min == 15.0 for f in added_fields))
-        self.assertEqual(c.total_area_ac, 650.0)
-        self.assertEqual(c.total_grain_bu, 130000.0)
-
-    def test_both_policies_finish_with_conservation(self):
-        c = SimulationConfig()
-        field_moistures = c.sample_field_moistures()
-        for policy in ("sequential", "reactive", "adaptive"):
-            with self.subTest(policy=policy):
-                result = Simulator(c, policy, field_moistures).run()
-                metrics = result.metrics
-                self.assertAlmostEqual(metrics["total_harvested_ac"], 650.0)
-                self.assertAlmostEqual(metrics["total_dried_grain_bu"], 130000.0,
-                                       places=5)
-                self.assertEqual(tuple(field.moisture_pct for field in result.fields),
-                                 field_moistures)
-                expected_average = sum(
-                    spec.area_ac * moisture
-                    for spec, moisture in zip(c.field_specs, field_moistures)
-                ) / c.total_area_ac
-                self.assertAlmostEqual(
-                    metrics["total_dried_average_moisture_pct"],
-                    expected_average,
-                )
-                accounted = (metrics["productive_harvest_time_h"]
-                             + metrics["blocked_time_h"]
-                             + metrics["switching_time_h"]
-                             + metrics["interior_mode_switching_time_h"]
-                             + metrics["scheduled_harvest_rest_time_h"])
-                self.assertAlmostEqual(metrics["harvest_completion_time_h"],
-                                       accounted, places=6)
-                self.assertAlmostEqual(metrics["mass_balance_error_bu"], 0.0)
-                self.assert_mass_balance(result, c)
-
-    def test_field_moisture_is_reproducible_and_policy_independent(self):
-        c = SimulationConfig(random_seed=42)
-        self.assertEqual(c.dryer_rate_for_moisture(18.0), 800.0)
-        self.assertEqual(c.dryer_rate_for_moisture(22.0), 400.0)
-        first = c.sample_field_moistures()
-        second = c.sample_field_moistures()
-        different_seed = replace(c, random_seed=43).sample_field_moistures()
-        self.assertEqual(first, second)
-        self.assertNotEqual(first, different_seed)
-        self.assertTrue(all(c.moisture_min_pct <= value <= c.moisture_max_pct
-                            for value in first))
-        sequential = Simulator(c, "sequential", first)
-        adaptive = Simulator(c, "adaptive", first)
-        reactive = Simulator(c, "reactive", first)
-        self.assertEqual(tuple(field.moisture_pct for field in sequential.fields),
-                         tuple(field.moisture_pct for field in adaptive.fields))
-        self.assertEqual(tuple(field.moisture_pct for field in sequential.fields),
-                         tuple(field.moisture_pct for field in reactive.fields))
-
-    def test_reactive_uses_current_pressure_without_changing_field_order(self):
-        c = SimulationConfig()
-        controller = ReactiveController(c)
+        controller = ThresholdController(c)
         common = {
-            "system_buffer_free_bu": (
-                c.combine_tank_capacity_bu
-                + c.semi_count * c.semi_capacity_bu
-                + c.receiving_pit_capacity_bu
-                + c.wet_bin_capacity_bu
-            ),
+            "system_buffer_free_bu": c.total_system_storage_bu,
             "wet_bin_inventory_bu": 0.0,
         }
         self.assertEqual(controller.choose_interior_mode(
@@ -220,16 +125,161 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(controller.choose_interior_mode(
             receiving_pressure=0.9, **common), MODE_1C)
 
-        result = Simulator(c, "reactive").run()
+    def test_reactive_rule_uses_physical_headroom_and_current_rates(self):
+        c = SimulationConfig()
+        controller = ReactiveController(c)
         self.assertEqual(
-            result.metrics["field_order"],
-            " -> ".join(field.field_id for field in c.field_specs),
+            controller.choose_interior_mode(**self.current_state(c)),
+            MODE_2C_1GC,
         )
-        self.assertGreater(result.metrics["number_of_interior_mode_switches"], 0)
-        self.assertGreater(result.metrics["intentional_slowdown_productive_h"], 0.0)
+        constrained = self.current_state(
+            c, system_buffer_free_bu=2000.0, field_mobile_free_bu=2000.0)
+        self.assertEqual(controller.choose_interior_mode(**constrained), MODE_1C)
+        transport_constrained = self.current_state(
+            c, transport_rate_buph=1000.0, field_mobile_free_bu=100.0)
+        self.assertEqual(
+            controller.choose_interior_mode(**transport_constrained), MODE_1C)
 
-    def test_every_field_finishes_before_switch(self):
-        result = Simulator(SimulationConfig(), "adaptive").run()
+    def test_reactive_is_invariant_to_future_trajectory(self):
+        c = SimulationConfig()
+        controller = ReactiveController(c)
+        state = self.current_state(c)
+        dry_future = (ForecastSegment(
+            "F1", INTERIOR, "rectangular", 10000.0, 18.0, 5000.0),)
+        wet_future = (ForecastSegment(
+            "F1", INTERIOR, "rectangular", 10000.0, 22.0, 1000.0),)
+        self.assertEqual(
+            controller.choose_interior_mode(
+                forecast_segments=dry_future, **state),
+            controller.choose_interior_mode(
+                forecast_segments=wet_future, **state),
+        )
+
+    def test_predictive_can_change_current_action_from_future_moisture(self):
+        c = replace(
+            SimulationConfig(),
+            field_specs=(FieldSpec("F1", 50.0, "rectangular", 5.0),),
+            wet_bin_capacity_bu=5000.0,
+            semi_count=1,
+            dryer_intercept_buph=4200.0,
+            dryer_moisture_slope_buph_per_pct=100.0,
+        )
+        controller = PredictiveController(c)
+        current = dict(
+            phase=INTERIOR,
+            geometry="rectangular",
+            productive_since_stop_h=12.0,
+            stop_elapsed_h=0.0,
+            in_stop=False,
+            mode_switches_used=0,
+            wet_bin_inventory_bu=3000.0,
+            response_time_h=0.5,
+        )
+        lots = (ForecastLot(3000.0, 18.0),)
+        dry_future = (
+            ForecastSegment("F1", INTERIOR, "rectangular", 10000.0, 18.0, 3000.0),
+            ForecastSegment("F2", INTERIOR, "rectangular", 50000.0, 18.0, 3000.0),
+        )
+        wet_future = (
+            ForecastSegment("F1", INTERIOR, "rectangular", 10000.0, 18.0, 3000.0),
+            ForecastSegment("F2", INTERIOR, "rectangular", 50000.0, 22.0, 3000.0),
+        )
+        common = dict(
+            stop_eligible=True,
+            available_modes=INTERIOR_MODES,
+            forecast_lots=lots,
+            **current,
+        )
+        self.assertEqual(controller.choose_schedule_action(
+            forecast_segments=dry_future, **common), HARVEST)
+        self.assertEqual(controller.choose_schedule_action(
+            forecast_segments=wet_future, **common), STOP)
+
+
+class SimulatorTests(unittest.TestCase):
+    def assert_mass_balance(self, result, config):
+        for row in result.time_series:
+            semi_grain = sum(row[f"semi_{index}_load_bu"]
+                             for index in range(1, config.semi_count + 1))
+            stored = (row["combine_tank_bu"]
+                      + row["grain_cart_inventory_bu"]
+                      + semi_grain
+                      + row["wet_bin_inventory_bu"])
+            self.assertAlmostEqual(
+                row["cumulative_grain_generated_bu"],
+                row["cumulative_grain_dried_bu"] + stored,
+                places=5,
+            )
+            self.assertEqual(row["receiving_pit_inventory_bu"], 0.0)
+            self.assertLessEqual(row["grain_cart_inventory_bu"],
+                                 config.grain_cart_capacity_bu + 1e-6)
+            self.assertLessEqual(row["wet_bin_inventory_bu"],
+                                 config.wet_bin_capacity_bu + 1e-6)
+
+    def test_revised_baseline_parameters_and_provisional_order(self):
+        c = SimulationConfig()
+        self.assertEqual(c.opening_area_fraction, 0.15)
+        self.assertEqual(c.interior_rate_buph(MODE_1C), 1600.0)
+        self.assertEqual(c.interior_rate_buph(MODE_2C), 3200.0)
+        self.assertEqual(c.interior_rate_buph(MODE_2C_1GC), 4000.0)
+        self.assertEqual(c.wet_bin_capacity_bu, 10000.0)
+        self.assertEqual(c.grain_cart_capacity_bu, 1000.0)
+        self.assertEqual(c.semi_count, 3)
+        self.assertEqual(c.receiving_pit_capacity_bu, 0.0)
+        self.assertEqual(c.prediction_horizon_h, 48.0)
+        self.assertEqual(c.stop_work_requirement_h, 12.0)
+        self.assertEqual(c.minimum_stop_h, 8.0)
+        self.assertEqual(
+            tuple(c.field_specs[index].field_id for index in c.field_order_indices()),
+            ("F3", "F6", "F2", "F5", "F7", "F8", "F9", "F10", "F1", "F4"),
+        )
+        simulator = Simulator(c)
+        self.assertTrue(all(
+            abs(field.opening_remaining_ac - 0.15 * field.total_area_ac) < 1e-9
+            for field in simulator.fields))
+
+    def test_opening_modes_preserve_geometry_ratios(self):
+        c = SimulationConfig()
+        simulator = Simulator(c)
+        irregular = simulator.fields[0]
+        rectangular = simulator.fields[1]
+        for mode in (MODE_1C, MODE_2C):
+            self.assertAlmostEqual(
+                simulator.capacity(irregular, OPENING, mode) * c.yield_bu_per_ac,
+                c.interior_rate_buph(mode) * c.irregular_opening_rate_fraction,
+            )
+            self.assertAlmostEqual(
+                simulator.capacity(rectangular, OPENING, mode) * c.yield_bu_per_ac,
+                c.interior_rate_buph(mode) * c.rectangular_opening_rate_fraction,
+            )
+
+    def test_four_policies_share_scenario_finish_and_conserve_mass(self):
+        c = SimulationConfig()
+        moistures = c.sample_field_moistures()
+        expected_order = " -> ".join(
+            c.field_specs[index].field_id for index in c.field_order_indices())
+        for policy in ("fixed", "threshold", "reactive", "predictive"):
+            with self.subTest(policy=policy):
+                result = Simulator(c, policy, moistures).run()
+                metrics = result.metrics
+                self.assertEqual(metrics["field_order"], expected_order)
+                self.assertAlmostEqual(metrics["total_harvested_ac"], c.total_area_ac)
+                self.assertAlmostEqual(
+                    metrics["total_dried_grain_bu"], c.total_grain_bu, places=5)
+                accounted = (
+                    metrics["productive_harvest_time_h"]
+                    + metrics["forced_blocking_time_h"]
+                    + metrics["switching_time_h"]
+                    + metrics["interior_mode_switching_time_h"]
+                    + metrics["planned_stop_time_h"]
+                )
+                self.assertAlmostEqual(
+                    metrics["harvest_completion_time_h"], accounted, places=6)
+                self.assertAlmostEqual(metrics["mass_balance_error_bu"], 0.0)
+                self.assert_mass_balance(result, c)
+
+    def test_field_sequence_finishes_opening_then_interior(self):
+        result = Simulator(SimulationConfig(), "predictive").run()
         phase_order = []
         for row in result.time_series:
             if row["combine_state"] != "HARVESTING":
@@ -243,159 +293,83 @@ class SimulatorTests(unittest.TestCase):
             for field_id in field_order
             for phase in (OPENING, INTERIOR)
         ])
-        self.assertEqual(len(field_order), 10)
         self.assertEqual(result.metrics["number_of_field_switches"], 9)
-        self.assertAlmostEqual(result.metrics["switching_time_h"], 180 / 60)
 
-    def test_transport_event_times_use_each_field_minutes(self):
-        result = Simulator(SimulationConfig(), "sequential").run()
-        departures = {(e["semi_id"], e["trip"]): e for e in result.transport_events
-                      if e["event"] == "DEPART_FIELD"}
-        starts = {(e["semi_id"], e["trip"]): e for e in result.transport_events
-                  if e["event"] == "START_UNLOAD"}
-        finishes = {(e["semi_id"], e["trip"]): e for e in result.transport_events
-                    if e["event"] == "FINISH_UNLOAD"}
-        returns = {(e["semi_id"], e["trip"]): e for e in result.transport_events
-                   if e["event"] == "RETURN_FIELD"}
-        for key, departure in departures.items():
-            arrival = next(e for e in result.transport_events
-                           if e["event"] == "ARRIVE_GC"
-                           and (e["semi_id"], e["trip"]) == key)
-            travel_h = departure["one_way_travel_min"] / 60.0
-            self.assertAlmostEqual(arrival["time_h"] - departure["time_h"],
-                                   travel_h, places=8)
-            nominal_unload_h = (
-                starts[key]["grain_bu"]
-                / (result.metrics["semi_capacity_bu"]
-                   / (result.metrics["semi_unload_time_min"] / 60.0))
-            )
-            self.assertGreaterEqual(
-                finishes[key]["time_h"] - starts[key]["time_h"] + 1e-8,
-                nominal_unload_h,
-            )
-            self.assertAlmostEqual(returns[key]["time_h"] - finishes[key]["time_h"],
-                                   travel_h, places=8)
-
-    def test_adaptive_forecast_reduces_forced_blocking(self):
+    def test_switch_limit_penalty_and_opening_transition_definition(self):
         c = SimulationConfig()
-        sequential = Simulator(c, "sequential").run()
-        adaptive = Simulator(c, "adaptive").run()
-        self.assertNotEqual(adaptive.metrics["field_order"],
-                            sequential.metrics["field_order"])
-        self.assertLess(
-            adaptive.metrics["harvest_completion_time_h"],
-            sequential.metrics["harvest_completion_time_h"],
-        )
-        self.assertLess(adaptive.metrics["blocked_time_h"],
-                        sequential.metrics["blocked_time_h"])
-
-    def test_effective_opening_and_interior_rates(self):
-        c = SimulationConfig()
-        simulator = Simulator(c)
-        irregular = simulator.fields[0]
-        rectangular = simulator.fields[1]
-        self.assertAlmostEqual(
-            simulator.capacity(irregular, OPENING) * c.yield_bu_per_ac,
-            c.irregular_opening_2c_rate_buph,
-        )
-        self.assertAlmostEqual(
-            simulator.capacity(rectangular, OPENING) * c.yield_bu_per_ac,
-            c.rectangular_opening_2c_rate_buph,
-        )
-        for mode in INTERIOR_MODES:
-            self.assertAlmostEqual(
-                simulator.capacity(irregular, INTERIOR, mode) * c.yield_bu_per_ac,
-                c.interior_rate_buph(mode),
-            )
-        self.assertEqual(c.interior_rate_buph(MODE_1C), 2000.0)
-        self.assertEqual(c.interior_rate_buph(MODE_2C), 4000.0)
-        self.assertEqual(c.interior_rate_buph(MODE_2C_1GC), 5000.0)
-
-    def test_interior_mode_control_respects_switch_and_dwell_limits(self):
-        c = SimulationConfig()
-        self.assertEqual(c.interior_prediction_horizon_h, 12.0)
-        self.assertEqual(c.interior_prediction_horizon_h,
-                         MIN_INTERIOR_PREDICTION_HORIZON_H)
-        sequential = Simulator(c, "sequential").run()
-        sequential_modes = {
-            row["operating_mode"] for row in sequential.time_series
-            if row["current_task"] == INTERIOR
-            and row["combine_state"] in ("HARVESTING", "BLOCKED")
-        }
-        self.assertEqual(sequential_modes, {MODE_2C_1GC})
-        self.assertEqual(sequential.metrics["number_of_interior_mode_switches"], 0)
-
-        adaptive = Simulator(c, "adaptive").run()
-        self.assertGreater(adaptive.metrics["intentional_slowdown_productive_h"], 0.0)
-        self.assertLessEqual(
-            adaptive.metrics["number_of_interior_mode_switches"],
-            len(c.field_specs) * c.max_interior_mode_switches,
-        )
-        events_by_field = {}
-        for row in adaptive.time_series:
-            if not str(row["event"]).startswith("MODE_"):
-                continue
-            events_by_field.setdefault(row["current_field"], []).append(row)
-        for field_id, events in events_by_field.items():
-            switches = [row for row in events if "SWITCH" in row["event"]]
-            self.assertLessEqual(len(switches), c.max_interior_mode_switches,
-                                 field_id)
-            for first, second in zip(events, events[1:]):
-                self.assertGreaterEqual(
-                    second["time_h"] - first["time_h"] + c.numerical_tolerance,
-                    c.minimum_interior_mode_dwell_h,
-                    field_id,
-                )
-
-    def test_optional_mode_switch_cost_is_counted(self):
-        c = replace(
-            SimulationConfig(),
-            field_specs=(FieldSpec("F1", 50.0, "irregular", 5.0),),
-            interior_mode_switch_time_h=5 / 60,
-        )
-        result = Simulator(c, "adaptive", (20.0,)).run()
+        result = Simulator(c, "predictive").run()
         switches = result.metrics["number_of_interior_mode_switches"]
-        self.assertGreater(switches, 0)
+        self.assertLessEqual(switches, len(c.field_specs))
         self.assertAlmostEqual(
             result.metrics["interior_mode_switching_time_h"],
-            switches * 5 / 60,
+            switches * c.interior_mode_switch_time_h,
         )
-        accounted = (result.metrics["productive_harvest_time_h"]
-                     + result.metrics["blocked_time_h"]
-                     + result.metrics["switching_time_h"]
-                     + result.metrics["interior_mode_switching_time_h"]
-                     + result.metrics["scheduled_harvest_rest_time_h"])
-        self.assertAlmostEqual(result.metrics["harvest_completion_time_h"],
-                               accounted)
+        for field_id in (field.field_id for field in result.fields):
+            starts = [row for row in result.time_series
+                      if row["current_field"] == field_id
+                      and str(row["event"]).startswith("MODE_SWITCH_START")]
+            self.assertLessEqual(len(starts), 1)
 
-    def test_fourteen_hour_harvest_then_ten_hour_rest(self):
+    def test_stop_requires_twelve_productive_hours_and_lasts_at_least_eight(self):
+        c = SimulationConfig()
+        result = Simulator(c, "threshold").run()
+        starts = [row for row in result.time_series
+                  if row["combine_state"] == "STOP_START"]
+        self.assertTrue(starts)
+        self.assertTrue(all(
+            row["productive_since_stop_h"] + c.numerical_tolerance
+            >= c.stop_work_requirement_h for row in starts))
+        self.assertGreaterEqual(
+            result.metrics["minimum_observed_planned_stop_duration_h"]
+            + c.numerical_tolerance,
+            c.minimum_stop_h,
+        )
+        self.assertNotIn(
+            "HARVEST_REST",
+            {row["combine_state"] for row in result.time_series},
+        )
+
+    def test_hard_bottleneck_does_not_create_permanent_voluntary_stop(self):
         c = replace(
             SimulationConfig(),
-            field_specs=(FieldSpec("F1", 500.0, "rectangular", 0.0),),
-            combine_tank_capacity_bu=200000.0,
-            wet_bin_capacity_bu=200000.0,
-            grain_leg_rate_buph=100000.0,
-            dryer_intercept_buph=100000.0,
-            dryer_moisture_slope_buph_per_pct=1.0,
+            wet_bin_capacity_bu=5000.0,
+            max_simulation_h=300.0,
         )
-        result = Simulator(c, "sequential", (20.0,)).run()
-        self.assertAlmostEqual(
-            result.metrics["scheduled_harvest_rest_time_h"], 10.0, places=6)
-        rest_rows = [row for row in result.time_series
-                     if row["combine_state"] == "HARVEST_REST"]
-        self.assertTrue(rest_rows)
-        self.assertAlmostEqual(rest_rows[0]["time_h"] - rest_rows[0]["duration_h"],
-                               14.0, places=6)
-        self.assertAlmostEqual(rest_rows[-1]["time_h"], 24.0, places=6)
-        for row in result.time_series:
-            if row["combine_state"] != "HARVESTING":
-                continue
-            midpoint_h = row["time_h"] - row["duration_h"] / 2.0
-            self.assertLess(midpoint_h % 24.0, 14.0)
+        moistures = c.sample_field_moistures()
+        for policy in ("reactive", "predictive"):
+            with self.subTest(policy=policy):
+                result = Simulator(c, policy, moistures).run()
+                self.assertAlmostEqual(
+                    result.metrics["total_harvested_ac"], c.total_area_ac)
+                self.assertLess(
+                    result.metrics["harvest_completion_time_h"],
+                    c.max_simulation_h,
+                )
+
+    def test_transport_event_times_use_each_field_distance(self):
+        result = Simulator(SimulationConfig(), "fixed").run()
+        departures = {(e["semi_id"], e["trip"]): e
+                      for e in result.transport_events
+                      if e["event"] == "DEPART_FIELD"}
+        arrivals = {(e["semi_id"], e["trip"]): e
+                    for e in result.transport_events
+                    if e["event"] == "ARRIVE_GC"}
+        finishes = {(e["semi_id"], e["trip"]): e
+                    for e in result.transport_events
+                    if e["event"] == "FINISH_UNLOAD"}
+        returns = {(e["semi_id"], e["trip"]): e
+                   for e in result.transport_events
+                   if e["event"] == "RETURN_FIELD"}
+        for key, departure in departures.items():
+            travel_h = departure["one_way_travel_min"] / 60.0
+            self.assertAlmostEqual(
+                arrivals[key]["time_h"] - departure["time_h"], travel_h)
+            self.assertAlmostEqual(
+                returns[key]["time_h"] - finishes[key]["time_h"], travel_h)
 
     def test_machine_hour_accounting(self):
         c = SimulationConfig()
-        result = Simulator(c, "sequential").run()
+        result = Simulator(c, "fixed").run()
         daily = calculate_daily_machine_hours(result.time_series, c.semi_count)
         summary = summarize_machine_hours(daily)
         self.assertGreater(len(daily), 1)
@@ -404,17 +378,8 @@ class SimulatorTests(unittest.TestCase):
             2.0 * result.metrics["productive_harvest_time_h"],
         )
         self.assertAlmostEqual(
-            summary["combine_switching_machine_h"],
-            2.0 * result.metrics["switching_time_h"],
-        )
-        self.assertAlmostEqual(
             summary["grain_cart_productive_machine_h"],
             result.metrics["interior_2c_1gc_productive_h"],
-        )
-        self.assertAlmostEqual(
-            summary["semi_active_machine_h"],
-            summary["semi_driving_machine_h"]
-            + summary["semi_unloading_machine_h"],
         )
         for resource in ("combine", "grain_cart", "semi", "total"):
             self.assertLessEqual(summary[f"{resource}_active_machine_h"],
@@ -422,61 +387,24 @@ class SimulatorTests(unittest.TestCase):
         for key, value in summary.items():
             self.assertAlmostEqual(value, result.metrics[key])
 
-    def test_adaptive_targets_one_rest_window_of_dryer_inventory(self):
-        c = SimulationConfig()
-        controller = AdaptiveController(c)
-        self.assertAlmostEqual(c.rest_dryer_inventory_target_bu(500.0), 5000.0)
-        self.assertAlmostEqual(c.rest_dryer_inventory_target_bu(800.0), 8000.0)
-
-        common = {
-            "remaining_grain_bu": 5000.0,
-            "field_mobile_free_bu": 10000.0,
-            "system_buffer_free_bu": 50000.0,
-            "transport_rate_buph": 10000.0,
-            "active_dryer_rate_buph": 500.0,
-            "upstream_inventory_bu": 0.0,
-            "hours_to_harvest_rest_h": 1.0,
-        }
-        self.assertEqual(
-            controller.choose_interior_mode(
-                wet_bin_inventory_bu=0.0, **common),
-            MODE_2C_1GC,
-        )
-        self.assertEqual(
-            controller.choose_interior_mode(
-                wet_bin_inventory_bu=5000.0, **common),
-            MODE_2C_1GC,
-        )
-
-        without_target = Simulator(
-            replace(c, rest_inventory_shortage_weight=0.0), "adaptive").run()
-        with_target = Simulator(c, "adaptive").run()
-        self.assertLessEqual(
-            with_target.metrics["dryer_idle_time_during_sampled_rests_h"],
-            without_target.metrics["dryer_idle_time_during_sampled_rests_h"],
-        )
-
     def test_invalid_configurations(self):
         cases = [
             {"semi_count": 0},
             {"grain_leg_rate_buph": 0.0},
             {"wet_bin_capacity_bu": -1.0},
-            {"receiving_pit_capacity_bu": 0.0},
-            {"field_specs": (FieldSpec("F1", 5.0, "irregular", 5.0),)},
-            {"field_specs": (FieldSpec("F1", 50.0, "round", 5.0),)},
+            {"receiving_pit_capacity_bu": -1.0},
+            {"opening_area_fraction": 0.0},
             {"random_seed": True},
             {"moisture_min_pct": 22.0},
             {"dryer_intercept_buph": 2200.0},
-            {"interior_1c_rate_buph": 4000.0},
+            {"interior_1c_rate_buph": 3200.0},
             {"max_interior_mode_switches": -1},
-            {"minimum_interior_mode_dwell_h": -0.1},
+            {"minimum_interior_mode_dwell_h": 0.0},
             {"interior_mode_switch_time_h": -0.1},
-            {"interior_prediction_horizon_h": 11.99},
-            {"rest_inventory_shortage_weight": -0.1},
-            {"rest_coverage_transport_fraction": 0.0},
-            {"rest_coverage_transport_fraction": 1.01},
-            {"harvest_work_window_h": 0.0},
-            {"harvest_rest_window_h": -0.1},
+            {"prediction_horizon_h": MIN_PREDICTION_HORIZON_H - 0.01},
+            {"control_decision_interval_h": 0.0},
+            {"default_field_order_rule": "unknown"},
+            {"field_specs": (FieldSpec("F1", 50.0, "round", 5.0),)},
         ]
         for values in cases:
             with self.subTest(values=values), self.assertRaises(ValueError):

@@ -36,7 +36,7 @@ def _field_resource_counts(row: dict[str, Any]) -> tuple[int, int]:
     mode = row["operating_mode"]
     if mode == MODE_1C:
         return 1, 0
-    if mode in ("Opening-2C", MODE_2C):
+    if mode == MODE_2C:
         return 2, 0
     if mode == MODE_2C_1GC:
         return 2, 1
@@ -52,8 +52,9 @@ def _interval_values(row: dict[str, Any], semi_count: int) -> dict[str, float]:
         values["combine_productive_machine_h"] = combine_count
         values["grain_cart_productive_machine_h"] = grain_cart_count
     elif state == "SWITCHING":
-        # Both combines relocate because every new field starts with Opening 2C.
-        values["combine_switching_machine_h"] = 2
+        # The pending field's selected/default opening mode determines whether
+        # one or two combines relocate.
+        values["combine_switching_machine_h"] = combine_count
     elif state == "BLOCKED":
         values["combine_blocked_machine_h"] = combine_count
         values["grain_cart_blocked_machine_h"] = grain_cart_count
@@ -87,8 +88,8 @@ def _interval_values(row: dict[str, Any], semi_count: int) -> dict[str, float]:
         elif semi_state == "WAITING_UNLOAD":
             values["semi_gc_waiting_machine_h"] += 1
         elif semi_state == "AT_FIELD" and state not in (
-                "HARVEST_REST", "POST_HARVEST", "HARVEST_COMPLETE",
-                "DONE", "IDLE"):
+                "PLANNED_STOP", "STOP_START", "STOP_END", "POST_HARVEST",
+                "HARVEST_COMPLETE", "DONE", "IDLE"):
             values["semi_field_standby_machine_h"] += 1
 
     values["semi_active_machine_h"] = (

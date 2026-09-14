@@ -1,0 +1,27 @@
+{
+  "generated_at": "2026-09-13T22:04:16.539142-04:00",
+  "command": "python run_experiments.py --joint-capacity-mechanism",
+  "policies": [
+    "fixed",
+    "threshold",
+    "reactive",
+    "predictive"
+  ],
+  "joint_capacity_scales": [
+    1.0,
+    4.0,
+    10.0
+  ],
+  "wet_bin_buffer_scales": [
+    0.5,
+    1.0,
+    2.0
+  ],
+  "paired_random_seed": 42,
+  "notes": [
+    "The earlier dryer-only mechanism outputs were preserved.",
+    "Dryer curve and grain-leg rate are multiplied by the same scale.",
+    "Nominal semi unload time is divided by that scale because unloading occurs through the grain leg.",
+    "The 10x case is nonbinding for the realized field moistures; transport capacity is reported explicitly."
+  ]
+}

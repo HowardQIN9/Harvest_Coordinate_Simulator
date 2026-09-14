@@ -20,9 +20,10 @@ class Field:
     @classmethod
     def create(cls, spec: FieldSpec, config: SimulationConfig,
                moisture_pct: float) -> "Field":
+        opening_area_ac = config.opening_area_ac(spec.area_ac)
         return cls(spec.field_id, spec.geometry, spec.one_way_travel_min,
-                   spec.area_ac, config.opening_area_ac,
-                   spec.area_ac - config.opening_area_ac, moisture_pct)
+                   spec.area_ac, opening_area_ac,
+                   spec.area_ac - opening_area_ac, moisture_pct)
 
     @property
     def opening_complete(self) -> bool:
