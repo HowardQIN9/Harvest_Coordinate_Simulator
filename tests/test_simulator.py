@@ -1,5 +1,6 @@
 import unittest
 from dataclasses import replace
+from unittest.mock import patch
 
 from harvest_sim import (
     MIN_PREDICTION_HORIZON_H,
@@ -17,7 +18,9 @@ from harvest_sim.controller import (
     HARVEST,
     STOP,
     ForecastLot,
+    ForecastOutcome,
     ForecastSegment,
+    MacroAction,
     PredictiveController,
     ReactiveController,
     ThresholdController,
@@ -155,45 +158,50 @@ class ControllerTests(unittest.TestCase):
                 forecast_segments=wet_future, **state),
         )
 
-    def test_predictive_can_change_current_action_from_future_moisture(self):
-        c = replace(
-            SimulationConfig(),
-            field_specs=(FieldSpec("F1", 50.0, "rectangular", 5.0),),
-            wet_bin_capacity_bu=5000.0,
-            semi_count=1,
-            dryer_intercept_buph=4200.0,
-            dryer_moisture_slope_buph_per_pct=100.0,
-        )
+    def test_predictive_uses_three_dimensional_pareto_comparison(self):
+        controller = PredictiveController(SimulationConfig())
+        resume = MacroAction(MODE_2C_1GC)
+        wait = MacroAction(MODE_2C_1GC, 6.0)
+        outcomes = {
+            resume: ForecastOutcome(
+                100.0, 110.0, 10.0, 3, 0.0, 0, 10.0, 3),
+            wait: ForecastOutcome(
+                100.0, 110.0, 2.0, 1, 6.0, 1, 2.0, 1),
+        }
+        with patch.object(
+                controller, "_rollout",
+                side_effect=lambda action, **_: outcomes[action]):
+            self.assertEqual(controller._preferred_macro_action(
+                (resume, wait), phase=INTERIOR,
+                geometry="rectangular"), wait)
+
+    def test_predictive_builds_joint_wait_and_resume_candidates(self):
+        c = SimulationConfig()
         controller = PredictiveController(c)
-        current = dict(
-            phase=INTERIOR,
-            geometry="rectangular",
-            productive_since_stop_h=12.0,
-            stop_elapsed_h=0.0,
-            in_stop=False,
-            mode_switches_used=0,
-            wet_bin_inventory_bu=3000.0,
-            response_time_h=0.5,
-        )
-        lots = (ForecastLot(3000.0, 18.0),)
-        dry_future = (
-            ForecastSegment("F1", INTERIOR, "rectangular", 10000.0, 18.0, 3000.0),
-            ForecastSegment("F2", INTERIOR, "rectangular", 50000.0, 18.0, 3000.0),
-        )
-        wet_future = (
-            ForecastSegment("F1", INTERIOR, "rectangular", 10000.0, 18.0, 3000.0),
-            ForecastSegment("F2", INTERIOR, "rectangular", 50000.0, 22.0, 3000.0),
-        )
-        common = dict(
-            stop_eligible=True,
-            available_modes=INTERIOR_MODES,
-            forecast_lots=lots,
-            **current,
-        )
-        self.assertEqual(controller.choose_schedule_action(
-            forecast_segments=dry_future, **common), HARVEST)
-        self.assertEqual(controller.choose_schedule_action(
-            forecast_segments=wet_future, **common), STOP)
+        candidates = controller._macro_candidates(
+            INTERIOR_MODES, in_stop=False, stop_elapsed_h=0.0,
+            stop_eligible=True)
+        waits = {action.wait_h for action in candidates}
+        self.assertEqual(waits, {0.0, 6.0, 6.5, 7.0})
+        self.assertIn(MacroAction(MODE_2C_1GC, 6.5), candidates)
+
+    def test_predictive_rejects_stop_that_idles_the_dryer(self):
+        controller = PredictiveController(SimulationConfig())
+        resume = MacroAction(MODE_2C)
+        wait = MacroAction(MODE_2C, 6.0)
+        outcomes = {
+            resume: ForecastOutcome(
+                100.0, 110.0, 10.0, 3, 0.0, 0, 10.0, 3),
+            wait: ForecastOutcome(
+                100.0, 110.0, 0.0, 0, 6.0, 1, 0.0, 0,
+                dryer_idle_during_planned_stop_h=1.0),
+        }
+        with patch.object(
+                controller, "_rollout",
+                side_effect=lambda action, **_: outcomes[action]):
+            self.assertEqual(controller._preferred_macro_action(
+                (resume, wait), phase=INTERIOR,
+                geometry="rectangular"), resume)
 
 
 class SimulatorTests(unittest.TestCase):
@@ -227,8 +235,10 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(c.semi_count, 3)
         self.assertEqual(c.receiving_pit_capacity_bu, 0.0)
         self.assertEqual(c.prediction_horizon_h, 48.0)
-        self.assertEqual(c.stop_work_requirement_h, 12.0)
-        self.assertEqual(c.minimum_stop_h, 8.0)
+        self.assertEqual(c.stop_work_requirement_h, 6.0)
+        self.assertEqual(c.minimum_stop_h, 6.0)
+        self.assertEqual(c.harvest_completion_tolerance_h, 1.0)
+        self.assertEqual(c.minimum_field_engaged_reduction_h, 5.0)
         self.assertEqual(
             tuple(c.field_specs[index].field_id for index in c.field_order_indices()),
             ("F3", "F6", "F2", "F5", "F7", "F8", "F9", "F10", "F1", "F4"),
@@ -268,13 +278,19 @@ class SimulatorTests(unittest.TestCase):
                     metrics["total_dried_grain_bu"], c.total_grain_bu, places=5)
                 accounted = (
                     metrics["productive_harvest_time_h"]
-                    + metrics["forced_blocking_time_h"]
+                    + metrics["blocked_time_h"]
                     + metrics["switching_time_h"]
                     + metrics["interior_mode_switching_time_h"]
                     + metrics["planned_stop_time_h"]
                 )
                 self.assertAlmostEqual(
                     metrics["harvest_completion_time_h"], accounted, places=6)
+                self.assertAlmostEqual(
+                    metrics["field_engaged_calendar_time_h"],
+                    metrics["harvest_completion_time_h"]
+                    - metrics["planned_stop_time_h"],
+                    places=6,
+                )
                 self.assertAlmostEqual(metrics["mass_balance_error_bu"], 0.0)
                 self.assert_mass_balance(result, c)
 
@@ -310,7 +326,7 @@ class SimulatorTests(unittest.TestCase):
                       and str(row["event"]).startswith("MODE_SWITCH_START")]
             self.assertLessEqual(len(starts), 1)
 
-    def test_stop_requires_twelve_productive_hours_and_lasts_at_least_eight(self):
+    def test_stop_respects_minimum_productive_work_and_stop_duration(self):
         c = SimulationConfig()
         result = Simulator(c, "threshold").run()
         starts = [row for row in result.time_series
@@ -401,6 +417,8 @@ class SimulatorTests(unittest.TestCase):
             {"max_interior_mode_switches": -1},
             {"minimum_interior_mode_dwell_h": 0.0},
             {"interior_mode_switch_time_h": -0.1},
+            {"forced_block_ignore_h": -0.1},
+            {"planned_stop_extension_options_h": ()},
             {"prediction_horizon_h": MIN_PREDICTION_HORIZON_H - 0.01},
             {"control_decision_interval_h": 0.0},
             {"default_field_order_rule": "unknown"},

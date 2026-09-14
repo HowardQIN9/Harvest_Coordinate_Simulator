@@ -25,6 +25,7 @@ def scenario_name(config: SimulationConfig, tag: str = "") -> str:
         f"_wetbin{config.wet_bin_capacity_bu:g}_leg{config.grain_leg_rate_buph:g}"
         f"_semis{config.semi_count}_order{config.default_field_order_rule}"
         f"_work{config.stop_work_requirement_h:g}h_stop{config.minimum_stop_h:g}h"
+        f"_fb{config.forced_block_ignore_h:g}h"
         f"_decision{config.control_decision_interval_h * 60:g}min"
         f"_forecast{config.prediction_horizon_h:g}h")
     return f"{name}_{tag}" if tag else name
@@ -120,7 +121,9 @@ def run_matched_scenario(config: SimulationConfig, output: Path) -> list[dict]:
 
     keys = [
         "policy", "harvest_completion_time_h", "system_completion_time_h",
-        "forced_blocking_time_h", "planned_stop_time_h",
+        "forced_blocking_time_h", "raw_forced_blocking_time_h",
+        "planned_stop_time_h",
+        "field_engaged_calendar_time_h", "number_of_forced_blocking_events",
         "number_of_planned_stops", "total_occupied_machine_h",
         "dryer_idle_time_during_planned_stops_h",
         "number_of_interior_mode_switches", "field_order",
@@ -146,6 +149,12 @@ def main() -> None:
                         default=defaults.stop_work_requirement_h)
     parser.add_argument("--minimum-stop-h", type=float,
                         default=defaults.minimum_stop_h)
+    parser.add_argument("--forced-block-ignore-h", type=float,
+                        default=defaults.forced_block_ignore_h)
+    parser.add_argument("--harvest-tolerance-h", type=float,
+                        default=defaults.harvest_completion_tolerance_h)
+    parser.add_argument("--minimum-field-reduction-h", type=float,
+                        default=defaults.minimum_field_engaged_reduction_h)
     parser.add_argument("--field-order-rule",
                         choices=["far_to_near", "near_to_far", "listed"],
                         default=defaults.default_field_order_rule)
@@ -156,6 +165,14 @@ def main() -> None:
         "--joint-capacity-mechanism", action="store_true",
         help=("Run a separate map that scales dryer, grain leg, and nominal "
               "unload service together and preserves complete traces"))
+    parser.add_argument(
+        "--joint-capacity-scales", nargs="+", type=float,
+        default=[1.0, 2.0, 4.0],
+        help="Joint downstream capacity multipliers")
+    parser.add_argument(
+        "--joint-buffer-scales", nargs="+", type=float,
+        default=[0.5, 1.0, 2.0],
+        help="Wet-bin capacity multipliers for the joint-capacity experiment")
     args = parser.parse_args()
 
     if args.mechanism and args.joint_capacity_mechanism:
@@ -167,6 +184,9 @@ def main() -> None:
         control_decision_interval_h=args.decision_interval_min / 60.0,
         stop_work_requirement_h=args.work_before_stop_h,
         minimum_stop_h=args.minimum_stop_h,
+        forced_block_ignore_h=args.forced_block_ignore_h,
+        harvest_completion_tolerance_h=args.harvest_tolerance_h,
+        minimum_field_engaged_reduction_h=args.minimum_field_reduction_h,
         default_field_order_rule=args.field_order_rule,
     )
     if not args.mechanism and not args.joint_capacity_mechanism:
@@ -177,8 +197,8 @@ def main() -> None:
         experiment_root = args.output_dir / "joint_capacity_mechanism"
         experiment_root.mkdir(parents=True, exist_ok=True)
         experiment_rows: list[dict] = []
-        for capacity_scale in (1.0, 4.0, 10.0):
-            for buffer_scale in (0.5, 1.0, 2.0):
+        for capacity_scale in args.joint_capacity_scales:
+            for buffer_scale in args.joint_buffer_scales:
                 config = replace(
                     base,
                     dryer_intercept_buph=(
@@ -261,14 +281,14 @@ def main() -> None:
                 "generated_at": datetime.now().astimezone().isoformat(),
                 "command": "python run_experiments.py --joint-capacity-mechanism",
                 "policies": list(POLICIES),
-                "joint_capacity_scales": [1.0, 4.0, 10.0],
-                "wet_bin_buffer_scales": [0.5, 1.0, 2.0],
+                "joint_capacity_scales": args.joint_capacity_scales,
+                "wet_bin_buffer_scales": args.joint_buffer_scales,
                 "paired_random_seed": base.random_seed,
                 "notes": [
                     "The earlier dryer-only mechanism outputs were preserved.",
                     "Dryer curve and grain-leg rate are multiplied by the same scale.",
                     "Nominal semi unload time is divided by that scale because unloading occurs through the grain leg.",
-                    "The 10x case is nonbinding for the realized field moistures; transport capacity is reported explicitly.",
+                    "The requested comparison uses 1x, 2x, and 4x joint downstream capacity.",
                 ],
             }, handle, indent=2)
         print(f"Wrote joint-capacity summary to {summary_path}")
@@ -285,7 +305,7 @@ def main() -> None:
     ]
     # A small one-factor check of the work-before-STOP constraint is added at
     # the middle capacity/buffer condition; duplicate cases are omitted.
-    for work_h in (8.0, 12.0, 16.0):
+    for work_h in (4.0, 6.0, 8.0):
         case = ("working_window_check", 4.0, 1.0, work_h)
         if not any(existing[1:] == case[1:] for existing in cases):
             cases.append(case)

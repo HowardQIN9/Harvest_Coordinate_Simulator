@@ -59,6 +59,12 @@ def main() -> None:
                         default=defaults.stop_work_requirement_h)
     parser.add_argument("--minimum-stop-h", type=float,
                         default=defaults.minimum_stop_h)
+    parser.add_argument("--forced-block-ignore-h", type=float,
+                        default=defaults.forced_block_ignore_h)
+    parser.add_argument("--harvest-tolerance-h", type=float,
+                        default=defaults.harvest_completion_tolerance_h)
+    parser.add_argument("--minimum-field-reduction-h", type=float,
+                        default=defaults.minimum_field_engaged_reduction_h)
     parser.add_argument("--field-order-rule",
                         choices=["far_to_near", "near_to_far", "listed"],
                         default=defaults.default_field_order_rule)
@@ -88,6 +94,9 @@ def main() -> None:
         control_decision_interval_h=args.decision_interval_min / 60.0,
         stop_work_requirement_h=args.work_before_stop_h,
         minimum_stop_h=args.minimum_stop_h,
+        forced_block_ignore_h=args.forced_block_ignore_h,
+        harvest_completion_tolerance_h=args.harvest_tolerance_h,
+        minimum_field_engaged_reduction_h=args.minimum_field_reduction_h,
         default_field_order_rule=args.field_order_rule,
     )
     field_moistures = config.sample_field_moistures()

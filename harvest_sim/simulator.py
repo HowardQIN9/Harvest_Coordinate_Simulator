@@ -175,7 +175,16 @@ class Simulator:
             return tuple(segments)
 
         def control_state(field: Field, task: str) -> dict[str, Any]:
-            available_modes = OPENING_MODES if task == OPENING else INTERIOR_MODES
+            if task == OPENING:
+                available_modes = ((current_opening_mode,)
+                                   if current_opening_mode else OPENING_MODES)
+            elif (current_interior_mode is not None
+                  and (field_interior_mode_switches >= c.max_interior_mode_switches
+                       or interior_mode_dwell_h + c.numerical_tolerance
+                       < c.minimum_interior_mode_dwell_h)):
+                available_modes = (current_interior_mode,)
+            else:
+                available_modes = INTERIOR_MODES
             combine_capacity, grain_cart_enabled = active_storage_context(task)
             system_free_bu = max(0.0, c.total_system_storage_bu - d.unprocessed_grain_bu)
             response_h = max(
@@ -197,6 +206,7 @@ class Simulator:
                 protection_h = max(response_h, hours_until_stop)
             return {
                 "phase": task,
+                "field_id": field.field_id,
                 "geometry": field.geometry,
                 "remaining_grain_bu": field.remaining(task) * c.yield_bu_per_ac,
                 "receiving_pressure": d.receiving_pressure,
@@ -217,8 +227,11 @@ class Simulator:
                 "in_stop": in_stop,
                 "stop_elapsed_h": stop_elapsed_h,
                 "productive_since_stop_h": productive_since_stop_h,
+                "elapsed_h": d.time_h,
+                "field_engaged_elapsed_h": d.time_h - planned_stop_h,
                 "available_modes": available_modes,
                 "mode_switches_used": field_interior_mode_switches,
+                "current_mode": active_mode_for(task),
                 "forecast_segments": forecast_segments(),
                 "forecast_lots": d.forecast_lots(),
             }
@@ -260,6 +273,8 @@ class Simulator:
                     self.fields[active[0]].moisture_pct if active else ""),
                 "combine_state": state,
                 "event": event,
+                "controller_macro_action": getattr(
+                    self.controller, "active_macro_label", ""),
                 "productive_since_stop_h": productive_since_stop_h,
                 "stop_eligible": int(
                     productive_since_stop_h + c.numerical_tolerance
@@ -385,6 +400,7 @@ class Simulator:
                         and action == HARVEST):
                     in_stop = False
                     stop_durations.append(current_stop_duration_h)
+                    stop_elapsed_h = 0.0
                     current_stop_duration_h = 0.0
                     stop_end_inventories.append(d.wet_bin_inventory_bu)
                     productive_since_stop_h = 0.0
@@ -524,6 +540,24 @@ class Simulator:
             sum(stop_end_inventories) / len(stop_end_inventories)
             if stop_end_inventories else 0.0)
 
+        forced_episodes_h: list[float] = []
+        current_forced_episode_h = 0.0
+        for row in series:
+            duration_h = float(row["duration_h"])
+            if duration_h <= c.numerical_tolerance:
+                continue
+            if row["combine_state"] == "BLOCKED":
+                current_forced_episode_h += duration_h
+            elif current_forced_episode_h > c.numerical_tolerance:
+                forced_episodes_h.append(current_forced_episode_h)
+                current_forced_episode_h = 0.0
+        if current_forced_episode_h > c.numerical_tolerance:
+            forced_episodes_h.append(current_forced_episode_h)
+        meaningful_forced_episodes_h = [
+            duration_h for duration_h in forced_episodes_h
+            if duration_h > c.forced_block_ignore_h + c.numerical_tolerance]
+        meaningful_forced_h = sum(meaningful_forced_episodes_h)
+
         metrics: dict[str, float | int | str] = {
             "policy": self.controller.name,
             "research_question": (
@@ -560,6 +594,10 @@ class Simulator:
             "control_decision_interval_min": c.control_decision_interval_h * 60.0,
             "stop_work_requirement_h": c.stop_work_requirement_h,
             "minimum_stop_h": c.minimum_stop_h,
+            "forced_block_ignore_h": c.forced_block_ignore_h,
+            "harvest_completion_tolerance_h": c.harvest_completion_tolerance_h,
+            "minimum_field_engaged_reduction_h": (
+                c.minimum_field_engaged_reduction_h),
             "number_of_planned_stops": stop_count,
             "planned_stop_time_h": planned_stop_h,
             "mean_planned_stop_duration_h": mean_stop_h,
@@ -582,7 +620,11 @@ class Simulator:
             "post_harvest_time_h": d.time_h - harvest_completion_h,
             "productive_harvest_time_h": productive_h,
             "blocked_time_h": 0.0 if blocked_h <= c.numerical_tolerance else blocked_h,
-            "forced_blocking_time_h": 0.0 if blocked_h <= c.numerical_tolerance else blocked_h,
+            "raw_forced_blocking_time_h": (
+                0.0 if blocked_h <= c.numerical_tolerance else blocked_h),
+            "forced_blocking_time_h": (
+                0.0 if meaningful_forced_h <= c.numerical_tolerance
+                else meaningful_forced_h),
             "switching_time_h": switching_h,
             "interior_mode_switching_time_h": mode_switching_h,
             "number_of_field_switches": field_switches,
@@ -628,6 +670,11 @@ class Simulator:
             "final_unprocessed_grain_bu": d.unprocessed_grain_bu,
             "mass_balance_error_bu": 0.0 if abs(mass_error) <= 1e-6 else mass_error,
         }
+        metrics["field_engaged_calendar_time_h"] = (
+            harvest_completion_h - planned_stop_h)
+        metrics["raw_number_of_forced_blocking_events"] = len(forced_episodes_h)
+        metrics["number_of_forced_blocking_events"] = len(
+            meaningful_forced_episodes_h)
         daily_machine_hours = calculate_daily_machine_hours(series, c.semi_count)
         metrics.update(summarize_machine_hours(daily_machine_hours))
         return SimulationResult(self.controller.name, metrics, series,

@@ -65,8 +65,19 @@ class SimulationConfig:
 
     # STOP is a system scheduling action, not a field mode. The eligibility
     # clock accumulates productive harvest time and pauses during other delays.
-    stop_work_requirement_h: float = 12.0
-    minimum_stop_h: float = 8.0
+    stop_work_requirement_h: float = 6.0
+    minimum_stop_h: float = 6.0
+    # Forced-block episodes at or below this operational deadband are retained
+    # in the raw trace but excluded from the controller benefit and the
+    # meaningful forced-block metrics.
+    forced_block_ignore_h: float = 0.1
+    # Once a STOP is eligible, Predictive evaluates the minimum STOP and these
+    # two explicit extensions as joint wait-then-resume macro actions.
+    planned_stop_extension_options_h: tuple[float, ...] = (0.5, 1.0)
+    # Evaluation-only preferences for comparing completed policies. They do
+    # not participate in Predictive's online macro-action selection.
+    harvest_completion_tolerance_h: float = 1.0
+    minimum_field_engaged_reduction_h: float = 5.0
     prediction_horizon_h: float = 48.0
     forecast_step_h: float = 15.0 / 60.0
     control_decision_interval_h: float = 15.0 / 60.0
@@ -126,12 +137,18 @@ class SimulationConfig:
                 raise ValueError(f"{name} must be finite and positive")
         nonnegative = (
             "interior_mode_switch_time_h", "field_switch_time_h",
-            "receiving_pit_capacity_bu",
+            "receiving_pit_capacity_bu", "harvest_completion_tolerance_h",
+            "minimum_field_engaged_reduction_h", "forced_block_ignore_h",
         )
         for name in nonnegative:
             value = getattr(self, name)
             if not isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
+        if (not self.planned_stop_extension_options_h
+                or any(not isfinite(value) or value <= 0
+                       for value in self.planned_stop_extension_options_h)):
+            raise ValueError(
+                "planned_stop_extension_options_h must contain finite positive values")
         if not 0 < self.opening_area_fraction < 1:
             raise ValueError("opening_area_fraction must be in (0, 1)")
         for name in (

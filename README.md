@@ -11,7 +11,7 @@
 - `fixed`：固定田块顺序；Opening 用 2C，Interior 用 2C+1GC；不主动 STOP。
 - `threshold`：普通 40%/80%/95% occupancy-threshold reference。
 - `reactive`：只根据 current state 的剩余 buffer、committed grain、当前 harvest/transport/dryer rate 和 response time 决策。
-- `predictive`：在相同 action space 和约束下，对候选当前 action 做 48 h rolling-horizon 推演。
+- `predictive`：在相同 action space 和约束下，对候选当前 action 做 completion-aware rollout；只有在整场收割完成时间容差内并能实质减少田间占用时，才以较慢完工换取更少的非计划堵塞。
 
 `sequential` 和 `adaptive` 仍可作为兼容命令使用，分别映射到 `fixed` 和 `predictive`；新实验与结果应使用四个正式名称。
 
@@ -32,9 +32,11 @@
 | Grain leg | 3,000 bu/h；满载 semi 名义卸粮 20 min |
 | Wet bin | 10,000 bu |
 | Dryer | continuous FIFO；暂用 `D(M)=2600-100M`，`M=18–22%` |
-| STOP | 累计 productive harvest ≥12 h 才可开始；至少 8 h |
+| STOP | 累计 productive harvest ≥6 h 才可开始；至少 6 h |
+| Forced STOP deadband | ≤0.1 h 的连续堵塞事件保留在raw trace，但不计入meaningful forced指标 |
+| Predictive macro actions | 联合比较立即恢复、最低STOP、额外0.5/1 h STOP与恢复模式 |
 | Control update | 每 15 min |
-| Predictive horizon | 48 h |
+| Predictive rollout | 使用聚合物流模型预测至收获和dryer处理完成 |
 
 STOP 是 system scheduling action，不是 field mode：只停止新粮生产，combine/cart/semi 中已有粮食仍可转运，grain leg 和 dryer 继续运行。Planned STOP 与 forced blocking 分开报告。
 
@@ -48,6 +50,8 @@ python run_baseline.py --policy threshold
 python run_baseline.py --policy reactive
 python run_baseline.py --policy predictive
 python run_experiments.py
+python run_experiments.py --joint-capacity-mechanism `
+  --joint-capacity-scales 1 2 4 --joint-buffer-scales 1
 python -m unittest discover -s tests -v
 ```
 
@@ -80,7 +84,7 @@ python run_experiments.py --mechanism
 
 - dryer curve scale `1× / 4× / 8×`；
 - wet-bin capacity scale `0.5× / 1× / 2×`；
-- 在中间 capacity/buffer 条件下附加 `8 / 12 / 16 h` work-before-STOP 检查。
+- 在中间 capacity/buffer 条件下附加 `4 / 6 / 8 h` work-before-STOP 检查。
 
 共 11 个独立 scenario configurations，每个都配对运行四策略。汇总写入 `results/current/mechanism/mechanism_summary.csv`，包含 `Q_harvest / mean dryer rate`，用于寻找 weak → transition → severe constraint 区域。
 
@@ -115,13 +119,18 @@ python run_baseline.py --policy predictive `
   --mode-switch-time-min 5 `
   --decision-interval-min 15 `
   --prediction-horizon-h 48 `
-  --work-before-stop-h 12 `
-  --minimum-stop-h 8 `
+  --work-before-stop-h 6 `
+  --minimum-stop-h 6 `
+  --forced-block-ignore-h 0.1 `
+  --harvest-tolerance-h 1 `
+  --minimum-field-reduction-h 5 `
   --field-order-rule far_to_near `
   --name-suffix trial
 ```
 
 以上是 PowerShell 的续行写法；也可以写成一行。
+`--harvest-tolerance-h`和`--minimum-field-reduction-h`只记录最终方法比较口径，
+不进入Predictive在线决策。
 
 ## 物理流和守恒
 
@@ -145,7 +154,9 @@ harvested grain
 
 - `harvest_completion_time_h`
 - `forced_blocking_time_h`
+- `raw_forced_blocking_time_h`
 - `planned_stop_time_h`
+- `field_engaged_calendar_time_h`（harvest completion 减 planned STOP）
 - `system_completion_time_h`
 - 设备 active/occupied machine-hours
 - inventory、queue、mode 和 STOP 的时间轨迹

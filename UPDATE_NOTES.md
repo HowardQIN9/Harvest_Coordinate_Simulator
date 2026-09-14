@@ -1,4 +1,49 @@
-# Update notes — 2026-09-13
+# Update notes — 2026-09-14
+
+## Joint macro-action and three-dimensional benefit update
+
+- Predictive now compares complete wait-then-resume macro actions. At an
+  eligible decision it evaluates immediate harvest modes and the minimum STOP
+  plus 0.5/1 h extensions, each paired with an explicit resume mode.
+- Removed the internal 1 h harvest tolerance and 5 h field-engagement gate.
+  Those values remain evaluation preferences only and do not select controller
+  actions.
+- Candidate rollouts are Pareto-filtered on harvest completion, meaningful
+  forced blocking, and field-engaged calendar time. A normalized ideal-point
+  distance selects one reproducible representative for execution.
+- Continuous forced-block episodes at or below 0.1 h are excluded from the
+  meaningful time/count, while raw forced time and count remain available.
+- A Planned STOP candidate is infeasible when its rollout predicts dryer idle
+  time during the STOP. This encodes the stated purpose of Planned STOP: let
+  the active downstream bottleneck consume existing grain.
+- The scheduler and mode decision now share the selected macro action. STOP
+  commitments use absolute time and reset their elapsed clock on completion.
+- The requested joint-capacity comparison uses 1x, 2x, and 4x at the common
+  1x wet-bin setting under `results/macro7/joint_capacity_mechanism/`.
+
+The field order remains shared and fixed. Only field-to-dryer travel times are
+available, so no field-to-field graph edges were invented in this update.
+
+## Preference-aware completion update
+
+- Retained Planned STOP as a deliberate congestion-management action while
+  changing its provisional minimum-up/minimum-down settings from 12/8 h to
+  6/6 h. No short scheduled-break action is included.
+- Added a campaign-wide 1 h harvest-completion tolerance. The controller may
+  spend that tolerance only when its forecast reduces field-engaged calendar
+  time by at least 5 h.
+- Added `field_engaged_calendar_time_h`, defined as harvest completion time
+  minus Planned STOP time, and counted forced-blocking episodes separately.
+- Replaced the fixed-terminal progress score with a completion-aware aggregate
+  rollout and an explicit fastest-unregulated reference. When the fastest mode
+  is physically safe, Predictive does not throttle to follow the dryer.
+- New joint-capacity outputs and the comparison with the prior experiment are
+  stored under `results/next4/joint_capacity_mechanism/`.
+
+The sections below document the superseded 2026-09-13 experiment and are kept
+for provenance.
+
+## Previous update — 2026-09-13
 
 ## Planned STOP and future grain-bag action
 

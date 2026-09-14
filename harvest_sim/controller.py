@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterable
 
 from .config import (
@@ -32,6 +32,43 @@ class ForecastSegment:
     remaining_grain_bu: float
     moisture_pct: float
     transport_rate_buph: float
+
+
+@dataclass(frozen=True)
+class ForecastOutcome:
+    harvest_completion_h: float
+    system_completion_h: float
+    forced_block_h: float
+    forced_block_starts: int
+    planned_stop_h: float
+    planned_stop_starts: int
+    meaningful_forced_block_h: float | None = None
+    meaningful_forced_block_starts: int | None = None
+    dryer_idle_during_planned_stop_h: float = 0.0
+
+    @property
+    def field_engaged_h(self) -> float:
+        return self.harvest_completion_h - self.planned_stop_h
+
+    @property
+    def benefit_forced_block_h(self) -> float:
+        if self.meaningful_forced_block_h is None:
+            return self.forced_block_h
+        return self.meaningful_forced_block_h
+
+
+@dataclass(frozen=True)
+class MacroAction:
+    """One committed wait-then-resume decision evaluated as a unit."""
+
+    mode: str
+    wait_h: float = 0.0
+
+    @property
+    def label(self) -> str:
+        if self.wait_h <= 0.0:
+            return f"RESUME_NOW->{self.mode}"
+        return f"WAIT_{self.wait_h:g}H->{self.mode}"
 
 
 def _fixed_choice(
@@ -238,14 +275,21 @@ class ReactiveController:
 
 @dataclass
 class PredictiveController(ReactiveController):
-    """Transparent 48-hour aggregate rolling-horizon controller.
+    """Completion-aware multiobjective macro-action controller.
 
-    It shares field order, actions, STOP constraints, and switch limits with
-    Reactive.  The sole treatment difference is that it scores each immediate
-    action using known future field segments and FIFO moisture lots.
+    It shares field order, physical constraints, and switch limits with the
+    references.  At each eligible decision it jointly evaluates how long to
+    wait and which mode to use after the wait.  Candidate rollouts are compared
+    on harvest completion, meaningful forced blocking, and field-engaged time.
     """
 
     name: str = "predictive"
+    _committed_stop_until_h: float | None = field(
+        default=None, init=False, repr=False)
+    _committed_resume_mode: str | None = field(
+        default=None, init=False, repr=False)
+    _scheduled_mode: str | None = field(default=None, init=False, repr=False)
+    active_macro_label: str = field(default="", init=False)
 
     def _dryer_step(
             self, queue: list[list[float]], duration_h: float) -> tuple[float, float]:
@@ -317,13 +361,14 @@ class PredictiveController(ReactiveController):
         return dried_bu, operating_h
 
     def _rollout(
-            self, first_action: str, *, forecast_segments: tuple[ForecastSegment, ...],
+            self, first_action: MacroAction | str, *,
+            forecast_segments: tuple[ForecastSegment, ...],
             forecast_lots: tuple[ForecastLot, ...], productive_since_stop_h: float,
             stop_elapsed_h: float, in_stop: bool,
             mode_switches_used: int, wet_bin_inventory_bu: float,
-            response_time_h: float, **_: float) -> tuple[float, float, float, float]:
+            response_time_h: float, tail_strategy: str = "coordinated",
+            **_: float) -> ForecastOutcome:
         c = self.config
-        horizon = c.prediction_horizon_h
         step_h = c.forecast_step_h
         dryer_queue: list[list[float]] = []
         upstream_queue: list[list[float]] = []
@@ -338,38 +383,80 @@ class PredictiveController(ReactiveController):
             wet_remaining_bu -= wet_amount
         segments = [[segment, segment.remaining_grain_bu]
                     for segment in forecast_segments]
-        initial_target_bu = sum(float(item[1]) for item in segments)
-        harvested_bu = 0.0
+        if isinstance(first_action, str):
+            macro = MacroAction(
+                MODE_1C if first_action == STOP else first_action,
+                c.minimum_stop_h if first_action == STOP else 0.0,
+            )
+        else:
+            macro = first_action
         forced_block_h = 0.0
+        forced_block_starts = 0
+        forced_blocking = False
+        forced_episode_h = 0.0
+        meaningful_forced_block_h = 0.0
+        meaningful_forced_block_starts = 0
         planned_stop_h = 0.0
+        planned_stop_starts = int(macro.wait_h > 0.0 and not in_stop)
         dryer_idle_h = 0.0
+        dryer_idle_during_planned_stop_h = 0.0
         elapsed_h = 0.0
-        stopping = in_stop or first_action == STOP
+        initial_wait_remaining_h = macro.wait_h
+        stopping = initial_wait_remaining_h > c.numerical_tolerance
         stop_clock = stop_elapsed_h if in_stop else 0.0
         work_clock = productive_since_stop_h
-        first_mode = first_action if first_action != STOP else MODE_1C
-        active_field_id = segments[0][0].field_id if segments else ""
+        active_segment = (
+            (segments[0][0].field_id, segments[0][0].phase)
+            if segments else ("", ""))
         switches_used = mode_switches_used
-        selected_mode = first_mode
+        selected_mode = macro.mode
 
-        while elapsed_h < horizon - c.numerical_tolerance and segments:
-            duration_h = min(step_h, horizon - elapsed_h)
+        def close_forced_episode() -> None:
+            nonlocal forced_episode_h
+            nonlocal meaningful_forced_block_h
+            nonlocal meaningful_forced_block_starts
+            if forced_episode_h > c.forced_block_ignore_h + c.numerical_tolerance:
+                meaningful_forced_block_h += forced_episode_h
+                meaningful_forced_block_starts += 1
+            forced_episode_h = 0.0
+
+        while segments:
+            if elapsed_h >= c.max_simulation_h:
+                raise RuntimeError(
+                    "Predictive completion rollout exceeded maximum duration")
+            duration_h = min(step_h, c.max_simulation_h - elapsed_h)
             segment = segments[0][0]
             remaining_bu = float(segments[0][1])
-            if segment.field_id != active_field_id:
-                active_field_id = segment.field_id
-                switches_used = 0
+            segment_key = (segment.field_id, segment.phase)
+            if segment_key != active_segment:
+                if segment.field_id != active_segment[0]:
+                    switches_used = 0
+                elif segment.phase == INTERIOR:
+                    switches_used = 0
+                active_segment = segment_key
                 selected_mode = (MODE_2C if segment.phase == OPENING
                                  else MODE_2C_1GC)
 
             if stopping:
+                close_forced_episode()
+                if initial_wait_remaining_h > c.numerical_tolerance:
+                    duration_h = min(duration_h, initial_wait_remaining_h)
                 _, operating = self._advance_forecast_downstream(
                     dryer_queue, upstream_queue,
                     segment.transport_rate_buph, duration_h)
                 dryer_idle_h += duration_h - operating
+                dryer_idle_during_planned_stop_h += duration_h - operating
                 planned_stop_h += duration_h
                 stop_clock += duration_h
                 elapsed_h += duration_h
+                forced_blocking = False
+                if initial_wait_remaining_h > c.numerical_tolerance:
+                    initial_wait_remaining_h -= duration_h
+                    if initial_wait_remaining_h <= c.numerical_tolerance:
+                        stopping = False
+                        stop_clock = 0.0
+                        work_clock = 0.0
+                    continue
                 if stop_clock + c.numerical_tolerance >= c.minimum_stop_h:
                     inventory_bu = (self._queue_amount(dryer_queue)
                                     + self._queue_amount(upstream_queue))
@@ -388,6 +475,14 @@ class PredictiveController(ReactiveController):
                         stopping = False
                         stop_clock = 0.0
                         work_clock = 0.0
+                        allowed_after_stop = (
+                            OPENING_MODES if segment.phase == OPENING
+                            else INTERIOR_MODES)
+                        selected_mode = max(
+                            allowed_after_stop,
+                            key=lambda mode: _rate(
+                                c, segment.phase, segment.geometry, mode),
+                        )
                 continue
 
             allowed_modes = (OPENING_MODES if segment.phase == OPENING
@@ -416,7 +511,8 @@ class PredictiveController(ReactiveController):
                  > field_capacity_bu - upstream_inventory_bu
                  + c.numerical_tolerance)
                     and segment.phase == INTERIOR
-                    and switches_used < c.max_interior_mode_switches):
+                    and switches_used < c.max_interior_mode_switches
+                    and tail_strategy != "fastest_unregulated"):
                 lower_modes = [mode for mode in INTERIOR_MODES
                                if c.interior_rate_buph(mode) < current_rate]
                 if lower_modes:
@@ -428,9 +524,11 @@ class PredictiveController(ReactiveController):
 
             if (projected_net > projected_free + c.numerical_tolerance
                     and work_clock + c.numerical_tolerance
-                    >= c.stop_work_requirement_h):
+                    >= c.stop_work_requirement_h
+                    and tail_strategy != "fastest_unregulated"):
                 stopping = True
                 stop_clock = 0.0
+                planned_stop_starts += 1
                 continue
 
             possible_bu = min(remaining_bu, current_rate * duration_h)
@@ -454,11 +552,18 @@ class PredictiveController(ReactiveController):
                 + transport_out_bu,
             )
             if possible_bu > accepted_bu + c.numerical_tolerance:
-                forced_block_h += (possible_bu - accepted_bu) / current_rate
+                blocked_step_h = (possible_bu - accepted_bu) / current_rate
+                forced_block_h += blocked_step_h
+                forced_episode_h += blocked_step_h
+                if not forced_blocking:
+                    forced_block_starts += 1
+                forced_blocking = True
+            else:
+                close_forced_episode()
+                forced_blocking = False
             if accepted_bu > c.numerical_tolerance:
                 self._append_forecast_lot(
                     upstream_queue, accepted_bu, segment.moisture_pct)
-                harvested_bu += accepted_bu
                 work_clock += accepted_bu / current_rate
                 segments[0][1] = remaining_bu - accepted_bu
 
@@ -470,33 +575,131 @@ class PredictiveController(ReactiveController):
             if float(segments[0][1]) <= c.numerical_tolerance:
                 finished = segments.pop(0)[0]
                 if segments and segments[0][0].field_id != finished.field_id:
-                    transition_h = min(c.field_switch_time_h,
-                                       horizon - elapsed_h)
+                    transition_h = c.field_switch_time_h
                     _, operating = self._advance_forecast_downstream(
                         dryer_queue, upstream_queue,
                         segment.transport_rate_buph, transition_h)
                     dryer_idle_h += transition_h - operating
                     elapsed_h += transition_h
 
-        remaining_target_bu = max(0.0, initial_target_bu - harvested_bu)
-        terminal_inventory_bu = (self._queue_amount(dryer_queue)
-                                 + self._queue_amount(upstream_queue))
-        # A fixed horizon must reward useful progress before distinguishing
-        # how that progress was obtained; otherwise an endless STOP has zero
-        # forced blocking and incorrectly dominates every productive action.
-        return (remaining_target_bu, forced_block_h,
-                dryer_idle_h, terminal_inventory_bu)
+        close_forced_episode()
+        harvest_completion_h = elapsed_h
+        last_transport_rate = (
+            forecast_segments[-1].transport_rate_buph
+            if forecast_segments else c.grain_leg_rate_buph)
+        while dryer_queue or upstream_queue:
+            if elapsed_h >= c.max_simulation_h:
+                raise RuntimeError(
+                    "Predictive downstream tail exceeded maximum duration")
+            duration_h = min(step_h, c.max_simulation_h - elapsed_h)
+            _, operating = self._advance_forecast_downstream(
+                dryer_queue, upstream_queue, last_transport_rate, duration_h)
+            dryer_idle_h += duration_h - operating
+            elapsed_h += duration_h
+
+        return ForecastOutcome(
+            harvest_completion_h=harvest_completion_h,
+            system_completion_h=elapsed_h,
+            forced_block_h=forced_block_h,
+            forced_block_starts=forced_block_starts,
+            planned_stop_h=planned_stop_h,
+            planned_stop_starts=planned_stop_starts,
+            meaningful_forced_block_h=meaningful_forced_block_h,
+            meaningful_forced_block_starts=meaningful_forced_block_starts,
+            dryer_idle_during_planned_stop_h=(
+                dryer_idle_during_planned_stop_h),
+        )
+
+    @staticmethod
+    def _objective(outcome: ForecastOutcome) -> tuple[float, float, float]:
+        return (
+            outcome.harvest_completion_h,
+            outcome.benefit_forced_block_h,
+            outcome.field_engaged_h,
+        )
+
+    @classmethod
+    def _dominates(cls, left: ForecastOutcome, right: ForecastOutcome) -> bool:
+        left_values = cls._objective(left)
+        right_values = cls._objective(right)
+        return (all(a <= b + 1e-9 for a, b in zip(left_values, right_values))
+                and any(a < b - 1e-9 for a, b in zip(left_values, right_values)))
+
+    def _preferred_macro_action(
+            self, actions: Iterable[MacroAction], **state: float) -> MacroAction:
+        """Return a balanced representative of the three-dimensional frontier."""
+        candidates = tuple(actions)
+        outcomes = {action: self._rollout(action, **state) for action in candidates}
+        feasible = [
+            action for action in candidates
+            if (outcomes[action].dryer_idle_during_planned_stop_h
+                <= self.config.numerical_tolerance)]
+        if feasible:
+            candidates = tuple(feasible)
+        frontier = [
+            action for action in candidates
+            if not any(
+                other != action
+                and self._dominates(outcomes[other], outcomes[action])
+                for other in candidates)
+        ]
+        columns = list(zip(*(self._objective(outcomes[action])
+                             for action in frontier)))
+        minima = tuple(min(column) for column in columns)
+        maxima = tuple(max(column) for column in columns)
+
+        def normalized_distance(action: MacroAction) -> tuple[float, ...]:
+            values = self._objective(outcomes[action])
+            normalized = tuple(
+                0.0 if maximum - minimum <= 1e-9
+                else (value - minimum) / (maximum - minimum)
+                for value, minimum, maximum in zip(values, minima, maxima)
+            )
+            # Euclidean distance supplies one neutral representative for
+            # execution; the complete frontier remains the scientific result.
+            distance = sum(value * value for value in normalized) ** 0.5
+            return (
+                distance,
+                max(normalized),
+                outcomes[action].system_completion_h,
+                outcomes[action].forced_block_h,
+                outcomes[action].planned_stop_starts,
+                -_rate(self.config, str(state["phase"]),
+                       str(state["geometry"]), action.mode),
+                action.wait_h,
+            )
+
+        return min(frontier, key=normalized_distance)
+
+    def _macro_candidates(
+            self, modes: Iterable[str], *, in_stop: bool,
+            stop_elapsed_h: float, stop_eligible: bool) -> tuple[MacroAction, ...]:
+        allowed = tuple(modes)
+        candidates = [MacroAction(mode) for mode in allowed]
+        if in_stop or stop_eligible:
+            minimum_remaining_h = (
+                max(0.0, self.config.minimum_stop_h - stop_elapsed_h)
+                if in_stop else self.config.minimum_stop_h)
+            waits = [minimum_remaining_h]
+            waits.extend(
+                minimum_remaining_h + extension
+                for extension in self.config.planned_stop_extension_options_h)
+            for wait_h in sorted(set(waits)):
+                if wait_h <= self.config.numerical_tolerance:
+                    continue
+                candidates.extend(MacroAction(mode, wait_h) for mode in allowed)
+        return tuple(candidates)
 
     def _predictive_mode(self, modes: Iterable[str], **state: float) -> str:
         candidates = tuple(modes)
-        return min(
-            candidates,
-            key=lambda mode: (
-                self._rollout(mode, **state),
-                -_rate(self.config, str(state["phase"]),
-                       str(state["geometry"]), mode),
-            ),
-        )
+        if self._scheduled_mode in candidates:
+            selected = self._scheduled_mode
+            self._scheduled_mode = None
+            return selected
+        action = self._preferred_macro_action(
+            tuple(MacroAction(mode) for mode in candidates), **state)
+        self.active_macro_label = action.label
+        return action.mode
 
     def choose_opening_mode(self, **state: float) -> str:
         return self._predictive_mode(OPENING_MODES, **state)
@@ -511,23 +714,35 @@ class PredictiveController(ReactiveController):
         c = self.config
         if in_stop and stop_elapsed_h < c.minimum_stop_h:
             return STOP
-        candidates = list(available_modes)
-        if in_stop or stop_eligible:
-            candidates.append(STOP)
-        best = min(
-            candidates,
-            key=lambda action: (
-                self._rollout(
-                    action,
-                    stop_eligible=stop_eligible,
-                    in_stop=in_stop,
-                    stop_elapsed_h=stop_elapsed_h,
-                    **state,
-                ),
-                1 if action == STOP else 0,
-            ),
+        elapsed_h = float(state.get("elapsed_h", 0.0))
+        if self._committed_stop_until_h is not None:
+            if elapsed_h + c.numerical_tolerance < self._committed_stop_until_h:
+                return STOP
+            self._scheduled_mode = self._committed_resume_mode
+            self._committed_stop_until_h = None
+            self._committed_resume_mode = None
+            return HARVEST
+
+        candidates = self._macro_candidates(
+            available_modes,
+            in_stop=in_stop,
+            stop_elapsed_h=stop_elapsed_h,
+            stop_eligible=stop_eligible,
         )
-        return STOP if best == STOP else HARVEST
+        best = self._preferred_macro_action(
+            candidates,
+            stop_eligible=stop_eligible,
+            in_stop=in_stop,
+            stop_elapsed_h=stop_elapsed_h,
+            **state,
+        )
+        self.active_macro_label = best.label
+        if best.wait_h > c.numerical_tolerance:
+            self._committed_stop_until_h = elapsed_h + best.wait_h
+            self._committed_resume_mode = best.mode
+            return STOP
+        self._scheduled_mode = best.mode
+        return HARVEST
 
 
 # Compatibility aliases for older imports and command lines.
