@@ -27,7 +27,16 @@ def main() -> None:
                         default=defaults.grain_leg_rate_buph)
     parser.add_argument("--wet-bin-capacity", type=float,
                         default=defaults.wet_bin_capacity_bu)
-    parser.add_argument("--semi-count", type=int, default=defaults.semi_count)
+    parser.add_argument("--combine-count", type=int, default=defaults.n_combines)
+    parser.add_argument("--grain-cart-count", type=int,
+                        default=defaults.n_grain_carts)
+    parser.add_argument("--semi-count", type=int, default=defaults.n_semis)
+    parser.add_argument("--combine-capacity", type=float,
+                        default=defaults.combine_harvest_capacity_buph,
+                        help="Harvest contribution per combine (bu/h)")
+    parser.add_argument("--grain-cart-capacity", type=float,
+                        default=defaults.grain_cart_harvest_capacity_buph,
+                        help="Team harvest contribution per active cart (bu/h)")
     parser.add_argument("--seed", type=int, default=defaults.random_seed)
     parser.add_argument("--moisture-min", type=float,
                         default=defaults.moisture_min_pct)
@@ -39,12 +48,6 @@ def main() -> None:
                         default=defaults.dryer_moisture_slope_buph_per_pct)
     parser.add_argument("--opening-fraction", type=float,
                         default=defaults.opening_area_fraction)
-    parser.add_argument("--interior-1c-rate", type=float,
-                        default=defaults.interior_1c_rate_buph)
-    parser.add_argument("--interior-2c-rate", type=float,
-                        default=defaults.interior_2c_rate_buph)
-    parser.add_argument("--interior-2c-1gc-rate", type=float,
-                        default=defaults.interior_2c_1gc_rate_buph)
     parser.add_argument("--mode-dwell-min", type=float,
                         default=defaults.minimum_interior_mode_dwell_h * 60.0)
     parser.add_argument("--max-mode-switches", type=int,
@@ -53,12 +56,21 @@ def main() -> None:
                         default=defaults.interior_mode_switch_time_h * 60.0)
     parser.add_argument("--prediction-horizon-h", type=float,
                         default=defaults.prediction_horizon_h)
+    parser.add_argument("--predictive-decision-interval-min", type=float,
+                        default=(
+                            defaults.predictive_decision_interval_h * 60.0))
+    parser.add_argument("--predictive-beam-width", type=int,
+                        default=defaults.predictive_beam_width)
     parser.add_argument("--decision-interval-min", type=float,
                         default=defaults.control_decision_interval_h * 60.0)
     parser.add_argument("--work-before-stop-h", type=float,
                         default=defaults.stop_work_requirement_h)
     parser.add_argument("--minimum-stop-h", type=float,
                         default=defaults.minimum_stop_h)
+    parser.add_argument("--stop-confirmation-min", type=float,
+                        default=defaults.stop_signal_confirmation_h * 60.0)
+    parser.add_argument("--maximum-dryer-idle-h", type=float,
+                        default=defaults.maximum_dryer_idle_episode_h)
     parser.add_argument("--forced-block-ignore-h", type=float,
                         default=defaults.forced_block_ignore_h)
     parser.add_argument("--harvest-tolerance-h", type=float,
@@ -77,23 +89,29 @@ def main() -> None:
     config = SimulationConfig(
         grain_leg_rate_buph=args.grain_leg_rate,
         wet_bin_capacity_bu=args.wet_bin_capacity,
-        semi_count=args.semi_count,
+        n_combines=args.combine_count,
+        n_grain_carts=args.grain_cart_count,
+        n_semis=args.semi_count,
+        combine_harvest_capacity_buph=args.combine_capacity,
+        grain_cart_harvest_capacity_buph=args.grain_cart_capacity,
         random_seed=args.seed,
         moisture_min_pct=args.moisture_min,
         moisture_max_pct=args.moisture_max,
         dryer_intercept_buph=args.dryer_intercept,
         dryer_moisture_slope_buph_per_pct=args.dryer_slope,
         opening_area_fraction=args.opening_fraction,
-        interior_1c_rate_buph=args.interior_1c_rate,
-        interior_2c_rate_buph=args.interior_2c_rate,
-        interior_2c_1gc_rate_buph=args.interior_2c_1gc_rate,
         minimum_interior_mode_dwell_h=args.mode_dwell_min / 60.0,
         max_interior_mode_switches=args.max_mode_switches,
         interior_mode_switch_time_h=args.mode_switch_time_min / 60.0,
         prediction_horizon_h=args.prediction_horizon_h,
+        predictive_decision_interval_h=(
+            args.predictive_decision_interval_min / 60.0),
+        predictive_beam_width=args.predictive_beam_width,
         control_decision_interval_h=args.decision_interval_min / 60.0,
         stop_work_requirement_h=args.work_before_stop_h,
         minimum_stop_h=args.minimum_stop_h,
+        stop_signal_confirmation_h=args.stop_confirmation_min / 60.0,
+        maximum_dryer_idle_episode_h=args.maximum_dryer_idle_h,
         forced_block_ignore_h=args.forced_block_ignore_h,
         harvest_completion_tolerance_h=args.harvest_tolerance_h,
         minimum_field_engaged_reduction_h=args.minimum_field_reduction_h,
@@ -106,9 +124,11 @@ def main() -> None:
         f"fields{len(config.field_specs)}_seed{config.random_seed}"
         f"_moisture{config.moisture_min_pct:g}-{config.moisture_max_pct:g}"
         f"_wetbin{config.wet_bin_capacity_bu:g}_leg{config.grain_leg_rate_buph:g}"
-        f"_semis{config.semi_count}_order{config.default_field_order_rule}"
+        f"_fleet{config.n_combines}C-{config.n_grain_carts}GC-"
+        f"{config.n_semis}S_order{config.default_field_order_rule}"
         f"_work{config.stop_work_requirement_h:g}h_stop{config.minimum_stop_h:g}h"
         f"_decision{config.control_decision_interval_h * 60:g}min"
+        f"_preddecision{config.predictive_decision_interval_h * 60:g}min"
         f"_forecast{config.prediction_horizon_h:g}h")
     if suffix:
         scenario += f"_{suffix}"
@@ -118,30 +138,37 @@ def main() -> None:
 
     with (scenario_dir / "field_scenario.csv").open(
             "w", newline="", encoding="utf-8") as handle:
-        fieldnames = ["field_id", "area_ac", "opening_area_ac", "geometry",
-                      "one_way_travel_min", "moisture_pct", "dryer_rate_buph"]
+        fieldnames = [
+            "field_id", "area_ac", "opening_area_ac", "opening_area_fraction",
+            "geometry", "opening_capacity_factor", "yield_bu_per_ac",
+            "one_way_travel_min", "moisture_pct", "dryer_rate_buph",
+        ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
-        for spec, moisture in zip(config.field_specs, field_moistures):
+        for field in result.fields:
             writer.writerow({
-                "field_id": spec.field_id,
-                "area_ac": spec.area_ac,
-                "opening_area_ac": config.opening_area_ac(spec.area_ac),
-                "geometry": spec.geometry,
-                "one_way_travel_min": spec.one_way_travel_min,
-                "moisture_pct": moisture,
-                "dryer_rate_buph": config.dryer_rate_for_moisture(moisture),
+                "field_id": field.field_id,
+                "area_ac": field.area_ac,
+                "opening_area_ac": field.opening_area_ac,
+                "opening_area_fraction": field.opening_area_fraction,
+                "geometry": field.geometry,
+                "opening_capacity_factor": field.opening_capacity_factor,
+                "yield_bu_per_ac": field.yield_bu_per_ac,
+                "one_way_travel_min": field.one_way_travel_min,
+                "moisture_pct": field.moisture_pct,
+                "dryer_rate_buph": config.dryer_rate_for_moisture(
+                    field.moisture_pct),
             })
 
     with (result_dir / "metrics.json").open("w", encoding="utf-8") as handle:
         json.dump(result.metrics, handle, indent=2)
     with (result_dir / "timeseries.csv").open(
             "w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=result.time_series[0].keys(),
+        writer = csv.DictWriter(handle, fieldnames=result.state_snapshots[0].keys(),
                                 lineterminator="\n")
         writer.writeheader()
-        writer.writerows(result.time_series)
-    daily = calculate_daily_machine_hours(result.time_series, config.semi_count)
+        writer.writerows(result.state_snapshots)
+    daily = calculate_daily_machine_hours(result.time_series, config.n_semis)
     with (result_dir / "daily_machine_hours.csv").open(
             "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=DAILY_MACHINE_HOUR_FIELDS,
@@ -156,6 +183,14 @@ def main() -> None:
                 lineterminator="\n")
             writer.writeheader()
             writer.writerows(result.transport_events)
+    if result.controller_decisions:
+        with (result_dir / "controller_decisions.csv").open(
+                "w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(
+                handle, fieldnames=result.controller_decisions[0].keys(),
+                lineterminator="\n")
+            writer.writeheader()
+            writer.writerows(result.controller_decisions)
 
     plot_result(result, config, result_dir / "overview.svg")
     plot_result(result, config, result_dir / "first_3h.svg", end_time_h=3.0)

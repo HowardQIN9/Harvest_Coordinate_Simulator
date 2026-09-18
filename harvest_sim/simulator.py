@@ -24,7 +24,14 @@ from .controller import (
     ThresholdController,
 )
 from .downstream import Downstream
-from .field import INTERIOR, OPENING, Field
+from .field import (
+    INTERIOR,
+    OPENING,
+    Field,
+    FieldGenerator,
+    FieldSelector,
+    FixedOrderFieldSelector,
+)
 
 
 @dataclass
@@ -34,12 +41,15 @@ class SimulationResult:
     time_series: list[dict[str, Any]]
     fields: list[Field]
     transport_events: list[dict[str, Any]]
+    controller_decisions: list[dict[str, Any]]
+    state_snapshots: list[dict[str, Any]]
 
 
 class Simulator:
     def __init__(
             self, config: SimulationConfig, policy: str = "fixed",
-            field_moistures_pct: tuple[float, ...] | None = None) -> None:
+            field_moistures_pct: tuple[float, ...] | None = None,
+            field_selector: FieldSelector | None = None) -> None:
         self.config = config
         moistures = (config.sample_field_moistures()
                      if field_moistures_pct is None else tuple(field_moistures_pct))
@@ -50,8 +60,10 @@ class Simulator:
                or value > config.moisture_max_pct for value in moistures):
             raise ValueError("field moisture must lie within the configured bounds")
         self.field_moistures_pct = moistures
-        self.fields = [Field.create(spec, config, moisture)
-                       for spec, moisture in zip(config.field_specs, moistures)]
+        self.fields = FieldGenerator.generate(config, moistures)
+        self.field_selector = (
+            FixedOrderFieldSelector(config.field_order_indices())
+            if field_selector is None else field_selector)
         self.downstream = Downstream(config)
         normalized = {"sequential": "fixed", "adaptive": "predictive"}.get(
             policy, policy)
@@ -68,16 +80,18 @@ class Simulator:
 
     def capacity(self, field: Field, task: str, mode: str = MODE_2C) -> float:
         """Effective capacity in ac/h; no further efficiency deduction applies."""
-        rate_buph = (self.config.opening_rate_buph(field.geometry, mode)
+        rate_buph = (self.config.opening_rate_buph(
+                         field.geometry, mode, field.opening_capacity_factor)
                      if task == OPENING
                      else self.config.interior_rate_buph(mode))
-        return rate_buph / self.config.yield_bu_per_ac
+        return rate_buph / field.yield_bu_per_ac
 
     def run(self) -> SimulationResult:
         c, d = self.config, self.downstream
         productive_h = blocked_h = switching_h = mode_switching_h = 0.0
         planned_stop_h = 0.0
         dryer_operating_during_stop_h = 0.0
+        maximum_dryer_idle_episode_during_stop_h = 0.0
         harvested_ac = generated_bu = 0.0
         field_switches = interior_mode_switches = 0
         intentional_slowdown_h = intentional_rate_reduction_bu = 0.0
@@ -103,20 +117,27 @@ class Simulator:
         stop_elapsed_h = 0.0
         productive_since_stop_h = 0.0
         stop_count = 0
+        stop_request_started_h: float | None = None
         stop_durations: list[float] = []
         current_stop_duration_h = 0.0
         stop_start_inventories: list[float] = []
         stop_end_inventories: list[float] = []
 
-        # All state-dependent policies reconsider their actions on the same
-        # clock.  This is both an experimental fairness condition and avoids
-        # pretending that farm decisions are revised every simulation minute.
+        # Physical state is observed every minute. Predictive performs the
+        # expensive rollout on its own 30-minute/event-driven planning clock;
+        # Threshold and Reactive use the one-minute control clock.
+        controller_decision_interval_h = (
+            c.predictive_decision_interval_h
+            if self.controller.name == "predictive"
+            else c.control_decision_interval_h)
         next_control_decision_h = 0.0
         cached_schedule_action = HARVEST
 
         harvest_completion_h: float | None = None
         harvest_end_inventory: dict[str, Any] = {}
         series: list[dict[str, Any]] = []
+        snapshots: list[dict[str, Any]] = []
+        next_snapshot_h = 0.0
 
         def begin_field(field_index: int) -> None:
             nonlocal current_opening_mode, current_interior_mode
@@ -135,16 +156,43 @@ class Simulator:
             interior_mode_sequences[field.field_id] = []
 
         def active_mode_for(task: str | None) -> str:
+            if pending_field is not None or task is None:
+                if current_interior_mode is not None:
+                    return current_interior_mode
+                if current_opening_mode is not None:
+                    return current_opening_mode
             if task == OPENING:
-                return current_opening_mode or MODE_2C
-            return current_interior_mode or MODE_2C_1GC
+                if current_opening_mode is not None:
+                    return current_opening_mode
+                modes = c.feasible_modes(OPENING_MODES)
+            else:
+                if current_interior_mode is not None:
+                    return current_interior_mode
+                modes = c.feasible_modes(INTERIOR_MODES)
+            return max(modes, key=c.interior_rate_buph)
 
-        def active_storage_context(task: str | None) -> tuple[float, bool]:
+        def active_storage_context(task: str | None) -> tuple[int, int]:
             mode = active_mode_for(task)
-            combine_capacity = (
-                c.combine_count_for_mode(mode)
-                * c.combine_tank_capacity_per_combine_bu)
-            return combine_capacity, c.grain_cart_enabled_for_mode(mode)
+            return (
+                c.combine_count_for_mode(mode),
+                c.grain_cart_count_for_mode(mode),
+            )
+
+        def effective_rate_buph(field: Field, task: str, mode: str) -> float:
+            """Current team rate after any individual combine blockage."""
+            requested_combines = c.combine_count_for_mode(mode)
+            working_combines = min(
+                requested_combines, d.working_combine_count)
+            if working_combines <= 0:
+                return 0.0
+            rate = (
+                working_combines * c.combine_harvest_capacity_buph
+                + c.grain_cart_count_for_mode(mode)
+                * c.grain_cart_harvest_capacity_buph
+            )
+            if task == OPENING:
+                rate *= field.opening_capacity_factor
+            return rate
 
         def transport_rate_buph(field: Field) -> float:
             cycle_h = (2.0 * field.one_way_travel_min / 60.0
@@ -163,29 +211,31 @@ class Simulator:
                 if field.opening_remaining_ac > c.numerical_tolerance:
                     segments.append(ForecastSegment(
                         field.field_id, OPENING, field.geometry,
-                        field.opening_remaining_ac * c.yield_bu_per_ac,
-                        field.moisture_pct, rate,
+                        field.opening_remaining_ac * field.yield_bu_per_ac,
+                        field.moisture_pct, rate, field.one_way_travel_min,
+                        field.opening_capacity_factor,
                     ))
                 if field.interior_remaining_ac > c.numerical_tolerance:
                     segments.append(ForecastSegment(
                         field.field_id, INTERIOR, field.geometry,
-                        field.interior_remaining_ac * c.yield_bu_per_ac,
-                        field.moisture_pct, rate,
+                        field.interior_remaining_ac * field.yield_bu_per_ac,
+                        field.moisture_pct, rate, field.one_way_travel_min,
                     ))
             return tuple(segments)
 
         def control_state(field: Field, task: str) -> dict[str, Any]:
             if task == OPENING:
-                available_modes = ((current_opening_mode,)
-                                   if current_opening_mode else OPENING_MODES)
+                available_modes = (
+                    (current_opening_mode,) if current_opening_mode
+                    else c.feasible_modes(OPENING_MODES))
             elif (current_interior_mode is not None
                   and (field_interior_mode_switches >= c.max_interior_mode_switches
                        or interior_mode_dwell_h + c.numerical_tolerance
                        < c.minimum_interior_mode_dwell_h)):
                 available_modes = (current_interior_mode,)
             else:
-                available_modes = INTERIOR_MODES
-            combine_capacity, grain_cart_enabled = active_storage_context(task)
+                available_modes = c.feasible_modes(INTERIOR_MODES)
+            active_combines, active_carts = active_storage_context(task)
             system_free_bu = max(0.0, c.total_system_storage_bu - d.unprocessed_grain_bu)
             response_h = max(
                 c.dt_h,
@@ -193,25 +243,27 @@ class Simulator:
                 + c.semi_unload_time_h
                 + c.interior_mode_switch_time_h,
             )
-            switch_available = (
-                task == INTERIOR
-                and field_interior_mode_switches < c.max_interior_mode_switches)
             stop_eligible = (
                 productive_since_stop_h + c.numerical_tolerance
                 >= c.stop_work_requirement_h)
             hours_until_stop = max(
                 0.0, c.stop_work_requirement_h - productive_since_stop_h)
-            protection_h = response_h
-            if not switch_available and not stop_eligible:
-                protection_h = max(response_h, hours_until_stop)
+            protection_h = c.reactive_mode_horizon_h
             return {
                 "phase": task,
                 "field_id": field.field_id,
                 "geometry": field.geometry,
-                "remaining_grain_bu": field.remaining(task) * c.yield_bu_per_ac,
+                "opening_capacity_factor": field.opening_capacity_factor,
+                "remaining_grain_bu": field.remaining_grain(task),
                 "receiving_pressure": d.receiving_pressure,
                 "field_mobile_free_bu": d.field_mobile_free_bu(
-                    combine_capacity, grain_cart_enabled),
+                    active_combines, active_carts),
+                "field_mobile_free_by_mode": {
+                    mode: d.field_mobile_free_bu(
+                        c.combine_count_for_mode(mode),
+                        c.grain_cart_count_for_mode(mode))
+                    for mode in available_modes
+                },
                 "system_buffer_free_bu": system_free_bu,
                 "wet_bin_inventory_bu": d.wet_bin_inventory_bu,
                 "wet_bin_free_bu": c.wet_bin_capacity_bu - d.wet_bin_inventory_bu,
@@ -226,29 +278,72 @@ class Simulator:
                 "hours_until_stop_eligible_h": hours_until_stop,
                 "in_stop": in_stop,
                 "stop_elapsed_h": stop_elapsed_h,
+                "stop_request_duration_h": (
+                    0.0 if stop_request_started_h is None
+                    else d.time_h - stop_request_started_h),
                 "productive_since_stop_h": productive_since_stop_h,
                 "elapsed_h": d.time_h,
                 "field_engaged_elapsed_h": d.time_h - planned_stop_h,
                 "available_modes": available_modes,
                 "mode_switches_used": field_interior_mode_switches,
                 "current_mode": active_mode_for(task),
+                "mode_initialized": (
+                    current_opening_mode is not None
+                    if task == OPENING else current_interior_mode is not None),
+                "interior_mode_dwell_h": interior_mode_dwell_h,
                 "forecast_segments": forecast_segments(),
-                "forecast_lots": d.forecast_lots(),
+                "transport_forecast": d,
             }
+
+        def minimum_stop_preserves_dryer(task: str) -> bool:
+            """Check the shared six-hour STOP against the dryer-idle limit."""
+            forecast = d.fork_for_forecast()
+            active_combines, active_carts = active_storage_context(task)
+            elapsed_h = 0.0
+            while (elapsed_h + c.numerical_tolerance
+                   < c.minimum_stop_h):
+                forecast.handle_events()
+                forecast.unload_field_storage(
+                    active_combines, active_carts, force=True)
+                forecast.dispatch_partial_loads(
+                    active_combines, active_carts)
+                if (forecast.current_dryer_idle_episode_h
+                        > (c.maximum_dryer_idle_episode_h
+                           + c.numerical_tolerance)):
+                    return False
+                step_h = min(
+                    c.forecast_step_h,
+                    c.minimum_stop_h - elapsed_h,
+                )
+                event_gap_h = forecast.next_event_h - forecast.time_h
+                if event_gap_h < step_h:
+                    step_h = event_gap_h
+                if step_h <= c.numerical_tolerance:
+                    forecast.handle_events()
+                    continue
+                forecast.advance_time(step_h)
+                elapsed_h += step_h
+            return (
+                forecast.current_dryer_idle_episode_h
+                <= (c.maximum_dryer_idle_episode_h
+                    + c.numerical_tolerance)
+            )
 
         def record(
                 state: str, active: TaskRef | None,
-                duration_h: float = 0.0, event: str = "") -> None:
+                duration_h: float = 0.0, event: str = "",
+                productive_combine_count: int = 0,
+                productive_grain_cart_count: int = 0) -> None:
+            nonlocal next_snapshot_h
             mass_error = generated_bu - d.total_dried_bu - d.unprocessed_grain_bu
             if abs(mass_error) > 1e-6:
                 raise AssertionError(f"Mass balance error: {mass_error}")
-            if not -c.numerical_tolerance <= d.combine_tank_bu <= c.maximum_combine_storage_bu + c.numerical_tolerance:
-                raise AssertionError("Combine grain tank outside physical bounds")
-            if not -c.numerical_tolerance <= d.grain_cart_inventory_bu <= c.grain_cart_capacity_bu + c.numerical_tolerance:
-                raise AssertionError("Grain cart outside physical bounds")
-            for semi in d.semis:
-                if not -c.numerical_tolerance <= semi.load_bu <= c.semi_capacity_bu + c.numerical_tolerance:
-                    raise AssertionError("Semi load outside physical bounds")
+            for vehicle in d.vehicles:
+                if not (-c.numerical_tolerance <= vehicle.load_bu
+                        <= vehicle.storage_capacity_bu
+                        + c.numerical_tolerance):
+                    raise AssertionError(
+                        f"{vehicle.vehicle_id} load outside physical bounds")
             if not -c.numerical_tolerance <= d.wet_bin_inventory_bu <= c.wet_bin_capacity_bu + c.numerical_tolerance:
                 raise AssertionError("Wet bin outside physical bounds")
             task = active[1] if active else None
@@ -256,9 +351,8 @@ class Simulator:
             active_rate_buph = 0.0
             if task:
                 field = self.fields[active[0]]
-                active_rate_buph = (
-                    c.opening_rate_buph(field.geometry, active_mode)
-                    if task == OPENING else c.interior_rate_buph(active_mode))
+                active_rate_buph = effective_rate_buph(
+                    field, task, active_mode)
             row = {
                 "time_h": d.time_h,
                 "duration_h": duration_h,
@@ -266,6 +360,8 @@ class Simulator:
                 "current_task": task or "",
                 "operating_mode": active_mode,
                 "effective_harvest_rate_buph": active_rate_buph,
+                "productive_combine_count": productive_combine_count,
+                "productive_grain_cart_count": productive_grain_cart_count,
                 "interior_mode_dwell_h": (interior_mode_dwell_h
                                            if task == INTERIOR else 0.0),
                 "interior_mode_switches_current_field": field_interior_mode_switches,
@@ -280,12 +376,22 @@ class Simulator:
                     productive_since_stop_h + c.numerical_tolerance
                     >= c.stop_work_requirement_h),
                 "current_stop_elapsed_h": stop_elapsed_h if in_stop else 0.0,
+                "stop_request_duration_h": (
+                    0.0 if stop_request_started_h is None
+                    else d.time_h - stop_request_started_h),
                 "cumulative_planned_stop_h": planned_stop_h,
                 "cumulative_harvested_ac": harvested_ac,
                 "cumulative_grain_generated_bu": generated_bu,
                 **d.snapshot(),
             }
             series.append(row)
+            if (not snapshots
+                    or event
+                    or d.time_h + c.numerical_tolerance >= next_snapshot_h
+                    or snapshots[-1]["combine_state"] != state):
+                snapshots.append(dict(row))
+                while next_snapshot_h <= d.time_h + c.numerical_tolerance:
+                    next_snapshot_h += c.snapshot_interval_h
 
         record("IDLE", None)
         while True:
@@ -298,18 +404,22 @@ class Simulator:
             event_start = len(d.events)
             d.handle_events()
             task = current[1] if current else None
-            combine_capacity, cart_enabled = active_storage_context(task)
+            active_combines, active_carts = active_storage_context(task)
             if harvest_finished:
-                d.dispatch_partial_loads(combine_capacity, cart_enabled)
+                d.dispatch_partial_loads(active_combines, active_carts)
             else:
-                d.unload_field_storage(combine_capacity, cart_enabled,
+                d.unload_field_storage(active_combines, active_carts,
                                        force=in_stop)
                 if in_stop:
-                    d.dispatch_partial_loads(combine_capacity, cart_enabled)
+                    d.dispatch_partial_loads(active_combines, active_carts)
             if len(d.events) > event_start:
                 names = ";".join(f"{event['semi_id']}:{event['event']}"
                                  for event in d.events[event_start:])
                 record("EVENT", current, event=names)
+                if (self.controller.name == "predictive"
+                        and (in_stop
+                             or stop_request_started_h is not None)):
+                    next_control_decision_h = d.time_h
 
             if harvest_finished and d.unprocessed_grain_bu <= c.numerical_tolerance:
                 record("DONE", None)
@@ -346,6 +456,7 @@ class Simulator:
                 d.advance_time(step)
                 interior_mode_switch_remaining_h -= step
                 mode_switching_h += step
+                productive_since_stop_h += step
                 record("MODE_SWITCHING", current, step)
                 if interior_mode_switch_remaining_h <= c.numerical_tolerance:
                     if pending_interior_mode is None or combine_field is None:
@@ -360,11 +471,13 @@ class Simulator:
                            event=f"MODE_SWITCH_COMPLETE:{current_interior_mode}")
                 continue
 
-            if combine_field is not None and not self.fields[combine_field].field_complete:
-                choice = (combine_field,
-                          self.fields[combine_field].available_tasks()[0])
+            selected_field = self.field_selector.choose_next(
+                self.fields, combine_field)
+            if selected_field is None:
+                choice = None
             else:
-                choice = self.controller.choose(self.fields, current)
+                tasks = self.fields[selected_field].available_tasks()
+                choice = (selected_field, tasks[0]) if tasks else None
             if choice is None:
                 raise AssertionError("Unfinished fields have no available task")
             if combine_field is not None and choice[0] != combine_field:
@@ -385,11 +498,18 @@ class Simulator:
                 d.time_h + c.numerical_tolerance >= next_control_decision_h)
             if control_due:
                 next_control_decision_h = (
-                    d.time_h + c.control_decision_interval_h)
+                    d.time_h + controller_decision_interval_h)
 
             if in_stop:
                 if stop_elapsed_h + c.numerical_tolerance < c.minimum_stop_h:
                     action = STOP
+                elif (d.current_dryer_idle_episode_h
+                      + c.numerical_tolerance
+                      >= c.maximum_dryer_idle_episode_h):
+                    # The common STOP supervisor overrides a strategy before
+                    # a voluntary stop can starve the continuously operated
+                    # dryer for more than the allowed one-hour episode.
+                    action = HARVEST
                 elif control_due:
                     cached_schedule_action = (
                         self.controller.choose_schedule_action(**state))
@@ -404,6 +524,7 @@ class Simulator:
                     current_stop_duration_h = 0.0
                     stop_end_inventories.append(d.wet_bin_inventory_bu)
                     productive_since_stop_h = 0.0
+                    stop_request_started_h = None
                     cached_schedule_action = HARVEST
                     record("STOP_END", current, event="VOLUNTARY_STOP_END")
                     continue
@@ -413,6 +534,10 @@ class Simulator:
                 d.advance_time(step)
                 dryer_operating_during_stop_h += (
                     d.total_dryer_operating_h - dryer_before_h)
+                maximum_dryer_idle_episode_during_stop_h = max(
+                    maximum_dryer_idle_episode_during_stop_h,
+                    d.current_dryer_idle_episode_h,
+                )
                 stop_elapsed_h += step
                 current_stop_duration_h += step
                 planned_stop_h += step
@@ -421,20 +546,37 @@ class Simulator:
 
             if not state["stop_eligible"]:
                 cached_schedule_action = HARVEST
+                stop_request_started_h = None
             elif control_due:
                 cached_schedule_action = (
                     self.controller.choose_schedule_action(**state))
             stop_action = cached_schedule_action
             if stop_action == STOP:
-                in_stop = True
-                stop_elapsed_h = 0.0
-                current_stop_duration_h = 0.0
-                cached_schedule_action = STOP
-                stop_count += 1
-                stop_start_inventories.append(d.wet_bin_inventory_bu)
-                d.dispatch_partial_loads(*active_storage_context(task))
-                record("STOP_START", current, event="VOLUNTARY_STOP_START")
-                continue
+                if stop_request_started_h is None:
+                    stop_request_started_h = d.time_h
+                confirmed_h = d.time_h - stop_request_started_h
+                if (confirmed_h + c.numerical_tolerance
+                        >= c.stop_signal_confirmation_h):
+                    if not minimum_stop_preserves_dryer(task):
+                        cached_schedule_action = HARVEST
+                        stop_request_started_h = None
+                        record(
+                            "STOP_REJECTED", current,
+                            event="DRYER_CONTINUITY_GUARD")
+                        continue
+                    in_stop = True
+                    stop_elapsed_h = 0.0
+                    current_stop_duration_h = 0.0
+                    cached_schedule_action = STOP
+                    stop_count += 1
+                    stop_start_inventories.append(d.wet_bin_inventory_bu)
+                    d.dispatch_partial_loads(*active_storage_context(task))
+                    record(
+                        "STOP_START", current,
+                        event="VOLUNTARY_STOP_START")
+                    continue
+            else:
+                stop_request_started_h = None
 
             if task == OPENING:
                 if current_opening_mode is None:
@@ -478,24 +620,29 @@ class Simulator:
                     raise AssertionError("Interior harvesting requires an operating mode")
                 mode = current_interior_mode
 
-            combine_capacity = (c.combine_count_for_mode(mode)
-                                * c.combine_tank_capacity_per_combine_bu)
-            cart_enabled = c.grain_cart_enabled_for_mode(mode)
-            d.unload_field_storage(combine_capacity, cart_enabled)
-            free_tank_bu = combine_capacity - d.combine_tank_bu
+            active_combines = c.combine_count_for_mode(mode)
+            active_carts = c.grain_cart_count_for_mode(mode)
+            d.unload_field_storage(active_combines, active_carts)
+            free_tank_bu = d.active_combine_free_bu(active_combines)
             if free_tank_bu <= c.numerical_tolerance:
                 d.advance_time(step)
                 blocked_h += step
+                productive_since_stop_h += step
                 if task == INTERIOR:
                     interior_mode_dwell_h += step
                 record("BLOCKED", current, step)
                 continue
 
-            capacity_acph = self.capacity(field, task, mode)
+            working_combine_count = min(
+                active_combines, d.working_combine_count)
+            active_rate_buph = effective_rate_buph(field, task, mode)
+            if active_rate_buph <= c.numerical_tolerance:
+                raise AssertionError("Positive combine storage has zero harvest rate")
+            capacity_acph = active_rate_buph / field.yield_bu_per_ac
             step = min(step, field.remaining(task) / capacity_acph,
-                       free_tank_bu / (capacity_acph * c.yield_bu_per_ac))
+                       free_tank_bu / active_rate_buph)
             acres = capacity_acph * step
-            grain = acres * c.yield_bu_per_ac
+            grain = acres * field.yield_bu_per_ac
             d.advance_time(step)
             d.add_harvested_grain(grain, field.moisture_pct, field.field_id)
             field.harvest(task, acres)
@@ -505,20 +652,36 @@ class Simulator:
             productive_since_stop_h += step
             if task == OPENING:
                 opening_productive_h_by_mode[mode] += step
-                maximum_rate = c.opening_rate_buph(field.geometry, MODE_2C)
-                if mode != MODE_2C:
+                fastest_opening_mode = max(
+                    c.feasible_modes(OPENING_MODES),
+                    key=c.interior_rate_buph)
+                maximum_rate = c.opening_rate_buph(
+                    field.geometry,
+                    fastest_opening_mode,
+                    field.opening_capacity_factor)
+                if mode != fastest_opening_mode:
                     intentional_slowdown_h += step
                     intentional_rate_reduction_bu += (
-                        maximum_rate - c.opening_rate_buph(field.geometry, mode)) * step
+                        maximum_rate
+                        - c.opening_rate_buph(
+                            field.geometry, mode,
+                            field.opening_capacity_factor)) * step
             else:
                 interior_mode_dwell_h += step
                 productive_h_by_mode[mode] += step
-                if mode != MODE_2C_1GC:
+                fastest_interior_mode = max(
+                    c.feasible_modes(INTERIOR_MODES),
+                    key=c.interior_rate_buph)
+                if mode != fastest_interior_mode:
                     intentional_slowdown_h += step
                     intentional_rate_reduction_bu += (
-                        c.interior_2c_1gc_rate_buph
+                        c.interior_rate_buph(fastest_interior_mode)
                         - c.interior_rate_buph(mode)) * step
-            record("HARVESTING", current, step)
+            record(
+                "HARVESTING", current, step,
+                productive_combine_count=working_combine_count,
+                productive_grain_cart_count=active_carts,
+            )
             if task not in field.available_tasks():
                 current = None
 
@@ -527,9 +690,22 @@ class Simulator:
         if in_stop and current_stop_duration_h > 0:
             stop_durations.append(current_stop_duration_h)
         mass_error = generated_bu - d.total_dried_bu - d.unprocessed_grain_bu
+        if abs(mass_error) > 1e-6:
+            raise AssertionError(f"Final mass balance error: {mass_error}")
+        if any(not field.field_complete for field in self.fields):
+            raise AssertionError("Simulation ended before every field completed")
+        if d.unprocessed_grain_bu > c.numerical_tolerance:
+            raise AssertionError("Simulation ended with unprocessed grain")
+        harvest_time_identity_h = (
+            productive_h + blocked_h + mode_switching_h
+            + switching_h + planned_stop_h)
+        if abs(harvest_completion_h - harvest_time_identity_h) > 1e-6:
+            raise AssertionError(
+                "Harvest time identity failed: "
+                f"{harvest_completion_h} != {harvest_time_identity_h}")
         field_by_id = {field.field_id: field for field in self.fields}
         grain_weighted_moisture = sum(
-            field.total_area_ac * c.yield_bu_per_ac * field.moisture_pct
+            field.total_area_ac * field.yield_bu_per_ac * field.moisture_pct
             for field in self.fields) / c.total_grain_bu
         stop_hours = sum(stop_durations)
         mean_stop_h = stop_hours / len(stop_durations) if stop_durations else 0.0
@@ -591,9 +767,17 @@ class Simulator:
             "maximum_interior_mode_switches_per_field": c.max_interior_mode_switches,
             "interior_mode_switch_time_min": c.interior_mode_switch_time_h * 60.0,
             "prediction_horizon_h": c.prediction_horizon_h,
-            "control_decision_interval_min": c.control_decision_interval_h * 60.0,
+            "predictive_beam_width": c.predictive_beam_width,
+            "predictive_search_implementation": "one_step_rollout",
+            "predictive_active_prefix_h": (
+                c.predictive_decision_interval_h),
+            "predictive_tail_policy": "threshold_to_completion",
+            "control_decision_interval_min": controller_decision_interval_h * 60.0,
             "stop_work_requirement_h": c.stop_work_requirement_h,
             "minimum_stop_h": c.minimum_stop_h,
+            "stop_signal_confirmation_h": c.stop_signal_confirmation_h,
+            "maximum_dryer_idle_episode_limit_h": (
+                c.maximum_dryer_idle_episode_h),
             "forced_block_ignore_h": c.forced_block_ignore_h,
             "harvest_completion_tolerance_h": c.harvest_completion_tolerance_h,
             "minimum_field_engaged_reduction_h": (
@@ -608,13 +792,18 @@ class Simulator:
             "dryer_operating_time_during_planned_stops_h": dryer_operating_during_stop_h,
             "dryer_idle_time_during_planned_stops_h": max(
                 0.0, planned_stop_h - dryer_operating_during_stop_h),
+            "maximum_dryer_idle_episode_during_planned_stops_h": (
+                maximum_dryer_idle_episode_during_stop_h),
             "semi_unload_time_min": c.semi_unload_time_h * 60.0,
             "combine_tank_capacity_per_combine_bu": c.combine_tank_capacity_per_combine_bu,
             "grain_cart_capacity_bu": c.grain_cart_capacity_bu,
-            "semi_count": c.semi_count,
+            "n_combines": c.n_combines,
+            "n_grain_carts": c.n_grain_carts,
+            "n_semis": c.n_semis,
+            "semi_count": c.n_semis,
             "semi_capacity_bu": c.semi_capacity_bu,
             "receiving_pit_capacity_bu": c.receiving_pit_capacity_bu,
-            "total_completion_time_h": harvest_completion_h,
+            "total_completion_time_h": d.time_h,
             "harvest_completion_time_h": harvest_completion_h,
             "system_completion_time_h": d.time_h,
             "post_harvest_time_h": d.time_h - harvest_completion_h,
@@ -672,10 +861,35 @@ class Simulator:
         }
         metrics["field_engaged_calendar_time_h"] = (
             harvest_completion_h - planned_stop_h)
+        metrics["field_operation_time_h"] = (
+            productive_h + blocked_h + mode_switching_h)
+        metrics["average_wet_bin_inventory_bu"] = (
+            sum(float(row["wet_bin_inventory_bu"])
+                * float(row["duration_h"]) for row in series)
+            / d.time_h if d.time_h > c.numerical_tolerance else 0.0)
+        metrics["dryer_operating_time_h"] = d.total_dryer_operating_h
+        metrics["dryer_idle_time_h"] = max(
+            0.0, d.time_h - d.total_dryer_operating_h)
+        metrics["dryer_starvation_time_after_start_h"] = (
+            d.total_dryer_starvation_h)
+        metrics["maximum_dryer_idle_episode_h"] = (
+            d.maximum_dryer_idle_episode_h)
+        metrics["semi_queue_waiting_time_h"] = sum(
+            float(row["duration_h"])
+            * sum(row[f"semi_{index}_state"] == "WAITING_UNLOAD"
+                  for index in range(1, c.n_semis + 1))
+            for row in series)
         metrics["raw_number_of_forced_blocking_events"] = len(forced_episodes_h)
         metrics["number_of_forced_blocking_events"] = len(
             meaningful_forced_episodes_h)
         daily_machine_hours = calculate_daily_machine_hours(series, c.semi_count)
         metrics.update(summarize_machine_hours(daily_machine_hours))
-        return SimulationResult(self.controller.name, metrics, series,
-                                self.fields, d.events)
+        return SimulationResult(
+            self.controller.name,
+            metrics,
+            series,
+            self.fields,
+            d.events,
+            list(getattr(self.controller, "decision_history", [])),
+            snapshots,
+        )

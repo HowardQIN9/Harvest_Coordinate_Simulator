@@ -32,9 +32,9 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
         f'<text x="{left}" y="112">Wet bin {config.wet_bin_capacity_bu:g} bu | Grain leg {config.grain_leg_rate_buph:g} bu/h | '
         f'Dryer D(M) = {config.dryer_intercept_buph:g} - {config.dryer_moisture_slope_buph_per_pct:g}M bu/h</text>',
         f'<text x="{left}" y="149">Field moisture U({config.moisture_min_pct:g}%, {config.moisture_max_pct:g}%), seed {config.random_seed} | '
-        f'Trips use 5, 15, or 20 min outbound + {config.semi_unload_time_h * 60:g} min nominal full-load unload '
+        f'Trips use each field\'s one-way travel time + {config.semi_unload_time_h * 60:g} min nominal full-load unload '
         f'(longer under backpressure) + equal return time</text>',
-        f'<text x="{left}" y="186">STOP after {config.stop_work_requirement_h:g} productive h; minimum '
+        f'<text x="{left}" y="186">STOP after {config.stop_work_requirement_h:g} eligibility-clock h; minimum '
         f'{config.minimum_stop_h:g} h | Predictive rolling horizon: '
         f'{config.prediction_horizon_h:g} h</text>',
     ]
@@ -94,20 +94,20 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
                 f'fill="{colors.get(label, "#cbd5e1")}"/>')
 
     mobile_capacity = (config.maximum_combine_storage_bu
-                       + config.grain_cart_capacity_bu
-                       + config.semi_count * config.semi_capacity_bu)
+                       + config.total_grain_cart_storage_bu
+                       + config.n_semis * config.semi_storage_capacity_bu)
     panel(0, "Field grain (bu)", mobile_capacity)
     line(0, "field_grain_bu", mobile_capacity, "#7c3aed")
     line(0, "combine_tank_bu", mobile_capacity, "#2563eb")
     legend(0, [("Total at field", "#7c3aed"), ("Combine tank", "#2563eb")])
 
-    panel(1, "Semi loads (bu)", config.semi_capacity_bu)
+    panel(1, "Semi loads (bu)", config.semi_storage_capacity_bu)
     palette = ["#d97706", "#0891b2", "#7c3aed", "#dc2626"]
-    for index in range(config.semi_count):
-        line(1, f"semi_{index + 1}_load_bu", config.semi_capacity_bu,
+    for index in range(config.n_semis):
+        line(1, f"semi_{index + 1}_load_bu", config.semi_storage_capacity_bu,
              palette[index % len(palette)])
     legend(1, [(f"Semi {index + 1}", palette[index % len(palette)])
-               for index in range(config.semi_count)])
+               for index in range(config.n_semis)])
 
     panel(2, "Semi states", None)
     truck_colors = {
@@ -117,8 +117,8 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
         "UNLOADING": "#9333ea",
         "RETURNING": "#2563eb",
     }
-    lane_h = panel_h / config.semi_count
-    for index in range(config.semi_count):
+    lane_h = panel_h / config.n_semis
+    for index in range(config.n_semis):
         yy = tops[2] + index * lane_h
         parts.append(f'<text class="tick" x="{left - 18}" y="{yy + lane_h / 2 + 8}" text-anchor="end">S{index + 1}</text>')
         intervals = [(first["time_h"], second["time_h"], first[f"semi_{index + 1}_state"])
@@ -130,9 +130,10 @@ def plot_result(result: SimulationResult, config: SimulationConfig, output: Path
                ("Unloading", truck_colors["UNLOADING"]),
                ("Returning", truck_colors["RETURNING"])])
 
-    panel(3, "Grain cart (bu)", config.grain_cart_capacity_bu)
-    line(3, "grain_cart_inventory_bu", config.grain_cart_capacity_bu, "#ea580c")
-    legend(3, [("Aggregate grain cart", "#ea580c")])
+    cart_plot_capacity = max(1.0, config.total_grain_cart_storage_bu)
+    panel(3, "Grain carts total (bu)", cart_plot_capacity)
+    line(3, "grain_cart_inventory_bu", cart_plot_capacity, "#ea580c")
+    legend(3, [("Sum of independent cart loads", "#ea580c")])
 
     panel(4, "Wet bin (bu)", config.wet_bin_capacity_bu)
     line(4, "wet_bin_inventory_bu", config.wet_bin_capacity_bu, "#0891b2", 3.0)

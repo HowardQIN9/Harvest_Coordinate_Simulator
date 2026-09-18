@@ -49,8 +49,16 @@ def _interval_values(row: dict[str, Any], semi_count: int) -> dict[str, float]:
     values: defaultdict[str, float] = defaultdict(float)
 
     if state == "HARVESTING":
-        values["combine_productive_machine_h"] = combine_count
-        values["grain_cart_productive_machine_h"] = grain_cart_count
+        productive_combines = int(
+            row.get("productive_combine_count", combine_count))
+        values["combine_productive_machine_h"] = productive_combines
+        # The system remains HARVESTING while at least one active combine can
+        # work. Any other active combine is nevertheless blocked equipment and
+        # must accrue blocked machine-hours during the same interval.
+        values["combine_blocked_machine_h"] = max(
+            0, combine_count - productive_combines)
+        values["grain_cart_productive_machine_h"] = int(
+            row.get("productive_grain_cart_count", grain_cart_count))
     elif state == "SWITCHING":
         # The pending field's selected/default opening mode determines whether
         # one or two combines relocate.

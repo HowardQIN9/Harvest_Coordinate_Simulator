@@ -23,10 +23,12 @@ def scenario_name(config: SimulationConfig, tag: str = "") -> str:
         f"fields{len(config.field_specs)}_seed{config.random_seed}"
         f"_moisture{config.moisture_min_pct:g}-{config.moisture_max_pct:g}"
         f"_wetbin{config.wet_bin_capacity_bu:g}_leg{config.grain_leg_rate_buph:g}"
-        f"_semis{config.semi_count}_order{config.default_field_order_rule}"
+        f"_fleet{config.n_combines}C-{config.n_grain_carts}GC-"
+        f"{config.n_semis}S_order{config.default_field_order_rule}"
         f"_work{config.stop_work_requirement_h:g}h_stop{config.minimum_stop_h:g}h"
         f"_fb{config.forced_block_ignore_h:g}h"
         f"_decision{config.control_decision_interval_h * 60:g}min"
+        f"_preddecision{config.predictive_decision_interval_h * 60:g}min"
         f"_forecast{config.prediction_horizon_h:g}h")
     return f"{name}_{tag}" if tag else name
 
@@ -44,19 +46,26 @@ def run_matched_scenario(config: SimulationConfig, output: Path) -> list[dict]:
 
     with (output / "field_scenario.csv").open(
             "w", newline="", encoding="utf-8") as handle:
-        fieldnames = ["field_id", "area_ac", "opening_area_ac", "geometry",
-                      "one_way_travel_min", "moisture_pct", "dryer_rate_buph"]
+        fieldnames = [
+            "field_id", "area_ac", "opening_area_ac", "opening_area_fraction",
+            "geometry", "opening_capacity_factor", "yield_bu_per_ac",
+            "one_way_travel_min", "moisture_pct", "dryer_rate_buph",
+        ]
         writer = csv.DictWriter(handle, fieldnames=fieldnames, lineterminator="\n")
         writer.writeheader()
-        for spec, moisture in zip(config.field_specs, field_moistures):
+        for field in results[0].fields:
             writer.writerow({
-                "field_id": spec.field_id,
-                "area_ac": spec.area_ac,
-                "opening_area_ac": config.opening_area_ac(spec.area_ac),
-                "geometry": spec.geometry,
-                "one_way_travel_min": spec.one_way_travel_min,
-                "moisture_pct": moisture,
-                "dryer_rate_buph": config.dryer_rate_for_moisture(moisture),
+                "field_id": field.field_id,
+                "area_ac": field.area_ac,
+                "opening_area_ac": field.opening_area_ac,
+                "opening_area_fraction": field.opening_area_fraction,
+                "geometry": field.geometry,
+                "opening_capacity_factor": field.opening_capacity_factor,
+                "yield_bu_per_ac": field.yield_bu_per_ac,
+                "one_way_travel_min": field.one_way_travel_min,
+                "moisture_pct": field.moisture_pct,
+                "dryer_rate_buph": config.dryer_rate_for_moisture(
+                    field.moisture_pct),
             })
 
     with (output / "policy_comparison.csv").open(
@@ -84,7 +93,7 @@ def run_matched_scenario(config: SimulationConfig, output: Path) -> list[dict]:
         writer.writeheader()
         for result in results:
             for daily_row in calculate_daily_machine_hours(
-                    result.time_series, config.semi_count):
+                    result.time_series, config.n_semis):
                 writer.writerow({"policy": result.policy, **daily_row})
 
     for result in results:
@@ -96,10 +105,10 @@ def run_matched_scenario(config: SimulationConfig, output: Path) -> list[dict]:
         with (policy_output / "timeseries.csv").open(
                 "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
-                handle, fieldnames=result.time_series[0].keys(),
+                handle, fieldnames=result.state_snapshots[0].keys(),
                 lineterminator="\n")
             writer.writeheader()
-            writer.writerows(result.time_series)
+            writer.writerows(result.state_snapshots)
         if result.transport_events:
             with (policy_output / "transport_events.csv").open(
                     "w", newline="", encoding="utf-8") as handle:
@@ -108,8 +117,17 @@ def run_matched_scenario(config: SimulationConfig, output: Path) -> list[dict]:
                     lineterminator="\n")
                 writer.writeheader()
                 writer.writerows(result.transport_events)
+        if result.controller_decisions:
+            with (policy_output / "controller_decisions.csv").open(
+                    "w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(
+                    handle,
+                    fieldnames=result.controller_decisions[0].keys(),
+                    lineterminator="\n")
+                writer.writeheader()
+                writer.writerows(result.controller_decisions)
         daily_rows = calculate_daily_machine_hours(
-            result.time_series, config.semi_count)
+            result.time_series, config.n_semis)
         with (policy_output / "daily_machine_hours.csv").open(
                 "w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(
@@ -123,9 +141,12 @@ def run_matched_scenario(config: SimulationConfig, output: Path) -> list[dict]:
         "policy", "harvest_completion_time_h", "system_completion_time_h",
         "forced_blocking_time_h", "raw_forced_blocking_time_h",
         "planned_stop_time_h",
-        "field_engaged_calendar_time_h", "number_of_forced_blocking_events",
+        "field_operation_time_h", "field_engaged_calendar_time_h",
+        "number_of_forced_blocking_events",
         "number_of_planned_stops", "total_occupied_machine_h",
         "dryer_idle_time_during_planned_stops_h",
+        "maximum_dryer_idle_episode_during_planned_stops_h",
+        "maximum_dryer_idle_episode_h",
         "number_of_interior_mode_switches", "field_order",
     ]
     print("\t".join(keys))
@@ -140,15 +161,27 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Compare harvest policies")
     parser.add_argument("--output-dir", type=Path,
                         default=Path("results/current"))
-    parser.add_argument("--semi-count", type=int, default=defaults.semi_count)
+    parser.add_argument("--combine-count", type=int, default=defaults.n_combines)
+    parser.add_argument("--grain-cart-count", type=int,
+                        default=defaults.n_grain_carts)
+    parser.add_argument("--semi-count", type=int, default=defaults.n_semis)
     parser.add_argument("--prediction-horizon-h", type=float,
                         default=defaults.prediction_horizon_h)
+    parser.add_argument("--predictive-decision-interval-min", type=float,
+                        default=(
+                            defaults.predictive_decision_interval_h * 60.0))
+    parser.add_argument("--predictive-beam-width", type=int,
+                        default=defaults.predictive_beam_width)
     parser.add_argument("--decision-interval-min", type=float,
                         default=defaults.control_decision_interval_h * 60.0)
     parser.add_argument("--work-before-stop-h", type=float,
                         default=defaults.stop_work_requirement_h)
     parser.add_argument("--minimum-stop-h", type=float,
                         default=defaults.minimum_stop_h)
+    parser.add_argument("--stop-confirmation-min", type=float,
+                        default=defaults.stop_signal_confirmation_h * 60.0)
+    parser.add_argument("--maximum-dryer-idle-h", type=float,
+                        default=defaults.maximum_dryer_idle_episode_h)
     parser.add_argument("--forced-block-ignore-h", type=float,
                         default=defaults.forced_block_ignore_h)
     parser.add_argument("--harvest-tolerance-h", type=float,
@@ -179,11 +212,18 @@ def main() -> None:
         parser.error("Choose only one mechanism experiment")
 
     base = SimulationConfig(
-        semi_count=args.semi_count,
+        n_combines=args.combine_count,
+        n_grain_carts=args.grain_cart_count,
+        n_semis=args.semi_count,
         prediction_horizon_h=args.prediction_horizon_h,
+        predictive_decision_interval_h=(
+            args.predictive_decision_interval_min / 60.0),
+        predictive_beam_width=args.predictive_beam_width,
         control_decision_interval_h=args.decision_interval_min / 60.0,
         stop_work_requirement_h=args.work_before_stop_h,
         minimum_stop_h=args.minimum_stop_h,
+        stop_signal_confirmation_h=args.stop_confirmation_min / 60.0,
+        maximum_dryer_idle_episode_h=args.maximum_dryer_idle_h,
         forced_block_ignore_h=args.forced_block_ignore_h,
         harvest_completion_tolerance_h=args.harvest_tolerance_h,
         minimum_field_engaged_reduction_h=args.minimum_field_reduction_h,
@@ -215,10 +255,10 @@ def main() -> None:
                 )
                 transport_capacities = [
                     min(
-                        config.semi_count * config.semi_capacity_bu
+                        config.n_semis * config.semi_storage_capacity_bu
                         / (2.0 * field.one_way_travel_min / 60.0
                            + config.semi_unload_time_h),
-                        config.semi_capacity_bu / config.semi_unload_time_h,
+                        config.semi_storage_capacity_bu / config.semi_unload_time_h,
                         config.grain_leg_rate_buph,
                     )
                     for field in config.field_specs
