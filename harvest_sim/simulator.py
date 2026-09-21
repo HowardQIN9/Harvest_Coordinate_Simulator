@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 from math import isfinite
 from typing import Any
 
@@ -45,11 +46,25 @@ class SimulationResult:
     state_snapshots: list[dict[str, Any]]
 
 
+@dataclass
+class SimulationCheckpoint:
+    """A forkable, complete state at a simulation step boundary."""
+
+    config: SimulationConfig
+    fields: list[Field]
+    downstream: Downstream
+    controller: Any
+    field_selector: FieldSelector
+    field_moistures_pct: tuple[float, ...]
+    state: dict[str, Any]
+
+
 class Simulator:
     def __init__(
             self, config: SimulationConfig, policy: str = "fixed",
             field_moistures_pct: tuple[float, ...] | None = None,
-            field_selector: FieldSelector | None = None) -> None:
+            field_selector: FieldSelector | None = None,
+            controller: Any | None = None) -> None:
         self.config = config
         moistures = (config.sample_field_moistures()
                      if field_moistures_pct is None else tuple(field_moistures_pct))
@@ -73,10 +88,13 @@ class Simulator:
             "reactive": ReactiveController,
             "predictive": PredictiveController,
         }
-        try:
-            self.controller = controllers[normalized](config)
-        except KeyError as error:
-            raise ValueError(f"Unknown policy: {policy}") from error
+        if controller is not None:
+            self.controller = controller
+        else:
+            try:
+                self.controller = controllers[normalized](config)
+            except KeyError as error:
+                raise ValueError(f"Unknown policy: {policy}") from error
 
     def capacity(self, field: Field, task: str, mode: str = MODE_2C) -> float:
         """Effective capacity in ac/h; no further efficiency deduction applies."""
@@ -86,8 +104,38 @@ class Simulator:
                      else self.config.interior_rate_buph(mode))
         return rate_buph / field.yield_bu_per_ac
 
-    def run(self) -> SimulationResult:
+    def run(
+            self, *, checkpoint_at_h: float | None = None,
+            checkpoint_after_completed_fields: int | None = None,
+            checkpoint_on_field_change: bool = False,
+            record_trace: bool = True,
+            simulation_step_h: float | None = None,
+            resume_from: SimulationCheckpoint | None = None,
+            resume_controller: Any | None = None,
+    ) -> SimulationResult | SimulationCheckpoint:
+        if resume_controller is not None and resume_from is None:
+            raise ValueError("resume_controller requires resume_from")
+        if resume_from is not None:
+            if resume_from.config != self.config:
+                raise ValueError("Checkpoint configuration does not match simulator")
+            self.fields = deepcopy(resume_from.fields)
+            self.downstream = deepcopy(resume_from.downstream)
+            self.field_selector = deepcopy(resume_from.field_selector)
+            self.field_moistures_pct = resume_from.field_moistures_pct
+            self.controller = deepcopy(
+                resume_from.controller if resume_controller is None
+                else resume_controller)
+        if checkpoint_at_h is not None and checkpoint_at_h < 0:
+            raise ValueError("checkpoint_at_h must be nonnegative")
+        if (checkpoint_after_completed_fields is not None
+                and checkpoint_after_completed_fields < 0):
+            raise ValueError(
+                "checkpoint_after_completed_fields must be nonnegative")
+        if simulation_step_h is not None and simulation_step_h <= 0:
+            raise ValueError("simulation_step_h must be positive")
         c, d = self.config, self.downstream
+        physical_step_h = (
+            c.dt_h if simulation_step_h is None else simulation_step_h)
         productive_h = blocked_h = switching_h = mode_switching_h = 0.0
         planned_stop_h = 0.0
         dryer_operating_during_stop_h = 0.0
@@ -138,6 +186,72 @@ class Simulator:
         series: list[dict[str, Any]] = []
         snapshots: list[dict[str, Any]] = []
         next_snapshot_h = 0.0
+
+        if resume_from is not None:
+            saved = resume_from.state
+            productive_h = saved["productive_h"]
+            blocked_h = saved["blocked_h"]
+            switching_h = saved["switching_h"]
+            mode_switching_h = saved["mode_switching_h"]
+            planned_stop_h = saved["planned_stop_h"]
+            dryer_operating_during_stop_h = saved[
+                "dryer_operating_during_stop_h"]
+            maximum_dryer_idle_episode_during_stop_h = saved[
+                "maximum_dryer_idle_episode_during_stop_h"]
+            harvested_ac = saved["harvested_ac"]
+            generated_bu = saved["generated_bu"]
+            field_switches = saved["field_switches"]
+            interior_mode_switches = saved["interior_mode_switches"]
+            intentional_slowdown_h = saved["intentional_slowdown_h"]
+            intentional_rate_reduction_bu = saved[
+                "intentional_rate_reduction_bu"]
+            productive_h_by_mode = deepcopy(saved["productive_h_by_mode"])
+            opening_productive_h_by_mode = deepcopy(
+                saved["opening_productive_h_by_mode"])
+            current = saved["current"]
+            combine_field = saved["combine_field"]
+            field_order = deepcopy(saved["field_order"])
+            pending_field = saved["pending_field"]
+            field_switch_remaining_h = saved["field_switch_remaining_h"]
+            current_opening_mode = saved["current_opening_mode"]
+            current_interior_mode = saved["current_interior_mode"]
+            pending_interior_mode = saved["pending_interior_mode"]
+            interior_mode_dwell_h = saved["interior_mode_dwell_h"]
+            interior_mode_switch_remaining_h = saved[
+                "interior_mode_switch_remaining_h"]
+            field_interior_mode_switches = saved[
+                "field_interior_mode_switches"]
+            opening_modes = deepcopy(saved["opening_modes"])
+            interior_mode_sequences = deepcopy(saved["interior_mode_sequences"])
+            in_stop = saved["in_stop"]
+            stop_elapsed_h = saved["stop_elapsed_h"]
+            productive_since_stop_h = saved["productive_since_stop_h"]
+            stop_count = saved["stop_count"]
+            stop_request_started_h = saved["stop_request_started_h"]
+            stop_durations = deepcopy(saved["stop_durations"])
+            current_stop_duration_h = saved["current_stop_duration_h"]
+            stop_start_inventories = deepcopy(saved["stop_start_inventories"])
+            stop_end_inventories = deepcopy(saved["stop_end_inventories"])
+            next_control_decision_h = saved["next_control_decision_h"]
+            cached_schedule_action = saved["cached_schedule_action"]
+            harvest_completion_h = saved["harvest_completion_h"]
+            harvest_end_inventory = deepcopy(saved["harvest_end_inventory"])
+            series = deepcopy(saved["series"])
+            snapshots = deepcopy(saved["snapshots"])
+            next_snapshot_h = saved["next_snapshot_h"]
+            if not record_trace:
+                series = []
+                snapshots = []
+                next_snapshot_h = d.time_h
+            if (resume_controller is not None
+                    and resume_controller is not resume_from.controller):
+                if stop_request_started_h is not None:
+                    raise ValueError(
+                        "Cannot change plan during STOP confirmation")
+                next_control_decision_h = d.time_h
+                cached_schedule_action = HARVEST
+
+        checkpoint_initial_field = combine_field
 
         def begin_field(field_index: int) -> None:
             nonlocal current_opening_mode, current_interior_mode
@@ -249,12 +363,16 @@ class Simulator:
             hours_until_stop = max(
                 0.0, c.stop_work_requirement_h - productive_since_stop_h)
             protection_h = c.reactive_mode_horizon_h
-            return {
+            state = {
                 "phase": task,
                 "field_id": field.field_id,
                 "geometry": field.geometry,
                 "opening_capacity_factor": field.opening_capacity_factor,
                 "remaining_grain_bu": field.remaining_grain(task),
+                "at_field_start": (
+                    task == OPENING
+                    and abs(field.remaining_area_ac - field.total_area_ac)
+                    <= c.numerical_tolerance),
                 "receiving_pressure": d.receiving_pressure,
                 "field_mobile_free_bu": d.field_mobile_free_bu(
                     active_combines, active_carts),
@@ -291,9 +409,11 @@ class Simulator:
                     current_opening_mode is not None
                     if task == OPENING else current_interior_mode is not None),
                 "interior_mode_dwell_h": interior_mode_dwell_h,
-                "forecast_segments": forecast_segments(),
                 "transport_forecast": d,
             }
+            if self.controller.name == "predictive":
+                state["forecast_segments"] = forecast_segments()
+            return state
 
         def minimum_stop_preserves_dryer(task: str) -> bool:
             """Check the shared six-hour STOP against the dryer-idle limit."""
@@ -346,6 +466,8 @@ class Simulator:
                         f"{vehicle.vehicle_id} load outside physical bounds")
             if not -c.numerical_tolerance <= d.wet_bin_inventory_bu <= c.wet_bin_capacity_bu + c.numerical_tolerance:
                 raise AssertionError("Wet bin outside physical bounds")
+            if not record_trace:
+                return
             task = active[1] if active else None
             active_mode = active_mode_for(task) if task else ""
             active_rate_buph = 0.0
@@ -393,8 +515,81 @@ class Simulator:
                 while next_snapshot_h <= d.time_h + c.numerical_tolerance:
                     next_snapshot_h += c.snapshot_interval_h
 
-        record("IDLE", None)
+        def make_checkpoint() -> SimulationCheckpoint:
+            state = {
+                "productive_h": productive_h,
+                "blocked_h": blocked_h,
+                "switching_h": switching_h,
+                "mode_switching_h": mode_switching_h,
+                "planned_stop_h": planned_stop_h,
+                "dryer_operating_during_stop_h": (
+                    dryer_operating_during_stop_h),
+                "maximum_dryer_idle_episode_during_stop_h": (
+                    maximum_dryer_idle_episode_during_stop_h),
+                "harvested_ac": harvested_ac,
+                "generated_bu": generated_bu,
+                "field_switches": field_switches,
+                "interior_mode_switches": interior_mode_switches,
+                "intentional_slowdown_h": intentional_slowdown_h,
+                "intentional_rate_reduction_bu": (
+                    intentional_rate_reduction_bu),
+                "productive_h_by_mode": productive_h_by_mode,
+                "opening_productive_h_by_mode": (
+                    opening_productive_h_by_mode),
+                "current": current,
+                "combine_field": combine_field,
+                "field_order": field_order,
+                "pending_field": pending_field,
+                "field_switch_remaining_h": field_switch_remaining_h,
+                "current_opening_mode": current_opening_mode,
+                "current_interior_mode": current_interior_mode,
+                "pending_interior_mode": pending_interior_mode,
+                "interior_mode_dwell_h": interior_mode_dwell_h,
+                "interior_mode_switch_remaining_h": (
+                    interior_mode_switch_remaining_h),
+                "field_interior_mode_switches": (
+                    field_interior_mode_switches),
+                "opening_modes": opening_modes,
+                "interior_mode_sequences": interior_mode_sequences,
+                "in_stop": in_stop,
+                "stop_elapsed_h": stop_elapsed_h,
+                "productive_since_stop_h": productive_since_stop_h,
+                "stop_count": stop_count,
+                "stop_request_started_h": stop_request_started_h,
+                "stop_durations": stop_durations,
+                "current_stop_duration_h": current_stop_duration_h,
+                "stop_start_inventories": stop_start_inventories,
+                "stop_end_inventories": stop_end_inventories,
+                "next_control_decision_h": next_control_decision_h,
+                "cached_schedule_action": cached_schedule_action,
+                "harvest_completion_h": harvest_completion_h,
+                "harvest_end_inventory": harvest_end_inventory,
+                "series": series,
+                "snapshots": snapshots,
+                "next_snapshot_h": next_snapshot_h,
+            }
+            return SimulationCheckpoint(
+                c, deepcopy(self.fields), deepcopy(d),
+                deepcopy(self.controller), deepcopy(self.field_selector),
+                self.field_moistures_pct, deepcopy(state))
+
+        if resume_from is None:
+            record("IDLE", None)
         while True:
+            completed_fields = sum(
+                field.field_complete for field in self.fields)
+            time_checkpoint = (
+                checkpoint_at_h is not None
+                and d.time_h + c.numerical_tolerance >= checkpoint_at_h)
+            completion_checkpoint = (
+                checkpoint_after_completed_fields is not None
+                and completed_fields >= checkpoint_after_completed_fields)
+            field_checkpoint = (
+                checkpoint_on_field_change
+                and combine_field is not None
+                and combine_field != checkpoint_initial_field)
+            if time_checkpoint or completion_checkpoint or field_checkpoint:
+                return make_checkpoint()
             harvest_finished = all(field.field_complete for field in self.fields)
             if harvest_finished and harvest_completion_h is None:
                 harvest_completion_h = d.time_h
@@ -427,7 +622,7 @@ class Simulator:
             if d.time_h >= c.max_simulation_h:
                 raise RuntimeError("Simulation exceeded maximum duration")
 
-            step = min(c.dt_h, d.next_event_h - d.time_h,
+            step = min(physical_step_h, d.next_event_h - d.time_h,
                        c.max_simulation_h - d.time_h)
             if step <= c.numerical_tolerance:
                 d.handle_events()
@@ -456,7 +651,6 @@ class Simulator:
                 d.advance_time(step)
                 interior_mode_switch_remaining_h -= step
                 mode_switching_h += step
-                productive_since_stop_h += step
                 record("MODE_SWITCHING", current, step)
                 if interior_mode_switch_remaining_h <= c.numerical_tolerance:
                     if pending_interior_mode is None or combine_field is None:
@@ -490,6 +684,9 @@ class Simulator:
             if combine_field != choice[0]:
                 combine_field = choice[0]
                 begin_field(combine_field)
+                if (checkpoint_on_field_change
+                        and combine_field != checkpoint_initial_field):
+                    return make_checkpoint()
 
             field = self.fields[current[0]]
             task = current[1]
@@ -529,7 +726,7 @@ class Simulator:
                     record("STOP_END", current, event="VOLUNTARY_STOP_END")
                     continue
                 step = min(step, max(
-                    c.dt_h, c.minimum_stop_h - stop_elapsed_h))
+                    physical_step_h, c.minimum_stop_h - stop_elapsed_h))
                 dryer_before_h = d.total_dryer_operating_h
                 d.advance_time(step)
                 dryer_operating_during_stop_h += (
@@ -552,6 +749,30 @@ class Simulator:
                     self.controller.choose_schedule_action(**state))
             stop_action = cached_schedule_action
             if stop_action == STOP:
+                immediate_boundary_stop = (
+                    bool(state["at_field_start"])
+                    and bool(getattr(
+                        self.controller,
+                        "allows_immediate_boundary_stop", False)))
+                if immediate_boundary_stop:
+                    if not minimum_stop_preserves_dryer(task):
+                        cached_schedule_action = HARVEST
+                        stop_request_started_h = None
+                        record(
+                            "STOP_REJECTED", current,
+                            event="DRYER_CONTINUITY_GUARD")
+                        continue
+                    in_stop = True
+                    stop_elapsed_h = 0.0
+                    current_stop_duration_h = 0.0
+                    cached_schedule_action = STOP
+                    stop_count += 1
+                    stop_start_inventories.append(d.wet_bin_inventory_bu)
+                    d.dispatch_partial_loads(*active_storage_context(task))
+                    record(
+                        "STOP_START", current,
+                        event="VOLUNTARY_STOP_START")
+                    continue
                 if stop_request_started_h is None:
                     stop_request_started_h = d.time_h
                 confirmed_h = d.time_h - stop_request_started_h
@@ -627,7 +848,6 @@ class Simulator:
             if free_tank_bu <= c.numerical_tolerance:
                 d.advance_time(step)
                 blocked_h += step
-                productive_since_stop_h += step
                 if task == INTERIOR:
                     interior_mode_dwell_h += step
                 record("BLOCKED", current, step)
@@ -768,10 +988,15 @@ class Simulator:
             "interior_mode_switch_time_min": c.interior_mode_switch_time_h * 60.0,
             "prediction_horizon_h": c.prediction_horizon_h,
             "predictive_beam_width": c.predictive_beam_width,
-            "predictive_search_implementation": "one_step_rollout",
+            "predictive_search_implementation": (
+                "one_step_rollout" if self.controller.name == "predictive"
+                else ""),
             "predictive_active_prefix_h": (
-                c.predictive_decision_interval_h),
-            "predictive_tail_policy": "threshold_to_completion",
+                c.predictive_decision_interval_h
+                if self.controller.name == "predictive" else 0.0),
+            "predictive_tail_policy": (
+                "threshold_to_completion"
+                if self.controller.name == "predictive" else ""),
             "control_decision_interval_min": controller_decision_interval_h * 60.0,
             "stop_work_requirement_h": c.stop_work_requirement_h,
             "minimum_stop_h": c.minimum_stop_h,

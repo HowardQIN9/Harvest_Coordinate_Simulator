@@ -246,6 +246,26 @@ $$
 
 > **实现状态：**代码已删除 48--72 h 自动扩展和乐观 terminal estimate。当前可验证版本采用 one-step rollout：压力引导生成当前候选，候选动作保持一个30 min决策间隔，之后立即由 Threshold 规则和完整逐车物流模型续算到 harvest/system completion。因此未来启停是物理模拟结果，但主动优化前缀目前只有30 min。把主动规划前缀扩展到完整48 h仍需要可复用的多层 Beam node、支配剪枝和相似状态合并；在该状态重构完成前，`predictive_beam_width`只是当前 macro-action frontier 的候选上限，不能把当前代码称为完整多层 Beam Search。
 
+**重写的第一步（已实现）：**`harvest_sim/open_loop.py` 提供指定田块模式和一次STOP请求的 `OpenLoopPlan`。`Simulator.run(checkpoint_at_h=...)` 在下一物理步边界保存完整运行检查点；`forecast_plan(checkpoint, plan)`从副本继续使用真实Simulator推进。两田测试覆盖收割中、6 h STOP中和恢复后的检查点：相同计划的完整时间轨迹、逐车事件和指标与不中断的真实运行一致；不同计划不会修改原检查点。预先计划的田块边界STOP在满足工作资格和dryer保护后立即开始；普通控制器请求仍需30 min确认。
+
+**四田滚动版本（已实现并完成10田试跑）：**`RollingFourFieldPredictive`每次读取完整检查点，向前模拟当前田和后续三块未完成田，只执行当前1 h动作后重新计算；换田时也立即重新计算。每块田以`2C+1GC`开始，田内最多切换两次并保持至少30 min。当前使用6类可解释的田块速度组合，并只在田块边界比较不STOP及6/10/14/18 h STOP。预测用5 min物理步长，真实执行仍用1 min步长。计划先保留不超过最快方案2 h的候选，再依次最小化raw forced blocking、STOP次数、模式切换、完成时间和期末库存。它是可运行的滚动多田预测原型，不是穷举Beam Search；候选速度组合、STOP位置及局部2 h容差仍需继续扩展和验证。
+
+默认10田场景、STOP资格改为累计1 h实际收获后的首次结果为：188.57 h完成收获，raw forced blocking为3.16 h，9次planned STOP合计126.05 h，11次田内模式切换。相同配置下Threshold为196.16 h、1.22 h、20次STOP；Reactive为193.11 h、1.01 h、23次STOP；Fixed为186.55 h、148.18 h、0次STOP。该版本把大量不可控堵塞转化为较少的长休息，并比Threshold和Reactive更早完成；相对Fixed仍晚2.02 h，且局部四田窗口的2 h容差不能保证全程差值严格小于2 h。完整输出保存在`results/current/rolling_four_field_predictive/`。
+
+#### 首次10田运行的 forced-blocking 诊断
+
+以下诊断使用全部10块田的逐分钟`timeseries.csv`，不是单个四田预测窗口。把所有`combine_state=BLOCKED`记录的`duration_h`相加得到3.1593 h raw forced blocking；连续记录合并后共有21次事件，其中10次持续至少0.1 h，合计2.5955 h meaningful forced blocking，另外11次短事件合计0.5639 h。
+
+按堵塞发生时的直接系统状态分类：wet bin已达到10000 bu容量的记录合计0.9492 h；wet bin未满但田间没有semi的记录合计2.2101 h；没有剩余其他类型。按当时模式分类，`1C`期间发生2.7867 h，占88.2%；`2C+1GC`期间发生0.3726 h。F2单田发生1.2326 h，其中0.9492 h来自wet bin装满。
+
+主要机制不是dryer总吞吐被严重低估，而是当前模式同时绑定收获速度和田间buffer。`1C`不使用grain cart，只有一台combine的300 bu储粮；在1600 bu/h下约11.25 min即可装满。当三辆semi同时离开田间时，即使运输的长期平均能力足够，也会产生短时forced blocking。第二个机制是planned STOP当前严格限制在田块边界，且本次运行只比较到18 h；F2开始前18 h STOP把wet bin从10000 bu降到约2343 bu，但该空间仍不足以支持F2完成，田中又不能主动等待，因此最终forced blocking。
+
+四田Forecast本身也还没有完整的多阶段动作序列。每个候选为每块田指定一个Interior模式，并最多在当前田块边界安排一次STOP；它不能在同一次预测中表达“全速30 min→降速→田界STOP→下一田恢复全速”，也不安排预测窗口内后续田界的STOP。第一次决策所选候选因此仍预测四田内34.15 h raw blocking，真实执行依靠后续53次重新规划逐步修正。5 min预测步长不是当前主要误差来源：第一次决策改用1 min步长后相同候选预测34.13 h，仅相差0.02 h。
+
+下一版应优先扩展动作结构：允许低收获速度同时保留grain cart提供buffer；根据剩余田块粮量、dryer速度和目标模式动态计算超过18 h的必要STOP长度；在四田窗口内显式搜索田内变速和多个田界STOP。之后再考虑把1 h重新规划间隔缩短为30 min。以上分类描述堵塞发生时的直接状态；各项修改能减少多少blocking仍需通过独立对照运行确认。
+
+使用 `python run_rolling_predictive.py --verbose` 可按相同默认参数重新运行。当前机器上的完整10田试跑约需4分钟；可用`--output-dir`指定新的结果目录，避免覆盖已有结果。
+
 ## Version 1 物理模型契约
 
 ### Field 与作业顺序

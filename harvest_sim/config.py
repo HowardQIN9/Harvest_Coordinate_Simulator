@@ -89,7 +89,8 @@ class SimulationConfig:
     interior_mode_switch_time_h: float = 5.0 / 60.0
     field_switch_time_h: float = 20.0 / 60.0
 
-    # STOP eligibility = HARVESTING + FORCED_BLOCKED + MODE_SWITCHING.
+    # STOP eligibility counts productive harvesting accumulated since the
+    # previous planned STOP. Forced blocking and mode switching do not count.
     stop_work_requirement_h: float = 6.0
     minimum_stop_h: float = 6.0
     stop_signal_confirmation_h: float = 30.0 / 60.0
