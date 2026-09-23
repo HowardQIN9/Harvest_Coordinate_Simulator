@@ -33,16 +33,14 @@ class OpenLoopController:
     """Replay field modes and, optionally, one planned STOP request.
 
     STOP is requested when the named field becomes active.  The common
-    simulator supervisor still applies work eligibility, dryer protection,
-    and minimum duration. A preplanned field-boundary STOP starts immediately;
-    ordinary controller requests still need signal confirmation. The resulting
-    trace records the *actual* start and end times; a request is not treated as
-    an executed STOP.
+    simulator supervisor still applies field-boundary eligibility, the
+    one-STOP-per-field limit, dryer protection, and minimum duration. The
+    resulting trace records the *actual* start and end times; a request is not
+    treated as an executed STOP.
     """
 
     name = "open_loop"
     allows_interior_mode_switching = True
-    allows_immediate_boundary_stop = True
 
     def __init__(self, config: SimulationConfig, plan: OpenLoopPlan) -> None:
         self.config = config

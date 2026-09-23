@@ -1,5 +1,11 @@
 # Update notes — 2026-09-14
 
+> [!IMPORTANT]
+> **Historical change log.** This file documents superseded controller
+> versions for provenance. Its 12 h/8 h STOP, 15 min control, 48 h horizon,
+> Pareto, and fixed-tolerance descriptions are not the current implementation.
+> Use [`README.md`](README.md) and the current code for the active definition.
+
 ## Joint macro-action and three-dimensional benefit update
 
 - Predictive now compares complete wait-then-resume macro actions. At an

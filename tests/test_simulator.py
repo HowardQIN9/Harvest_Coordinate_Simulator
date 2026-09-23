@@ -8,6 +8,7 @@ from harvest_sim import (
     MODE_2C,
     MODE_2C_1GC,
     FieldSpec,
+    FieldScenarioGenerator,
     SimulationConfig,
     Simulator,
     calculate_daily_machine_hours,
@@ -27,6 +28,11 @@ from harvest_sim.controller import (
 )
 from harvest_sim.downstream import AT_FIELD, RETURNING, UNLOADING, Downstream, GrainLot
 from harvest_sim.field import INTERIOR, OPENING
+from harvest_sim.open_loop import (
+    FieldAction,
+    OpenLoopController,
+    OpenLoopPlan,
+)
 
 
 class DownstreamTests(unittest.TestCase):
@@ -211,6 +217,21 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(
             controller.choose_interior_mode(**transport_constrained), MODE_1C)
 
+    def test_reactive_wet_bin_control_limit_reserves_headroom(self):
+        full = SimulationConfig(wet_bin_control_limit_fraction=1.0)
+        safe = SimulationConfig(wet_bin_control_limit_fraction=0.95)
+        state = self.current_state(
+            full,
+            field_mobile_free_bu=1_000_000.0,
+            system_buffer_free_bu=full.total_system_storage_bu,
+            active_dryer_rate_buph=4000.0,
+        )
+        full_margin = ReactiveController(full).physical_margin_bu(
+            MODE_2C_1GC, **state)
+        safe_margin = ReactiveController(safe).physical_margin_bu(
+            MODE_2C_1GC, **state)
+        self.assertAlmostEqual(full_margin - safe_margin, 500.0)
+
     def test_reactive_is_invariant_to_future_trajectory(self):
         c = SimulationConfig()
         controller = ReactiveController(c)
@@ -378,7 +399,8 @@ class ControllerTests(unittest.TestCase):
         )
 
     def test_predictive_rejects_stop_exceeding_dryer_idle_limit(self):
-        controller = PredictiveController(SimulationConfig())
+        config = SimulationConfig()
+        controller = PredictiveController(config)
         resume = MacroAction(MODE_2C)
         wait = MacroAction(MODE_2C, 6.0)
         outcomes = {
@@ -387,7 +409,8 @@ class ControllerTests(unittest.TestCase):
             wait: ForecastOutcome(
                 100.0, 110.0, 0.0, 0, 6.0, 1, 0.0, 0,
                 dryer_idle_during_planned_stop_h=2.0,
-                maximum_dryer_idle_episode_h=1.01),
+                maximum_dryer_idle_episode_h=(
+                    config.maximum_dryer_idle_episode_h + 0.01)),
         }
         with patch.object(
                 controller, "_rollout",
@@ -402,8 +425,9 @@ class ControllerTests(unittest.TestCase):
             next(row for row in controller.decision_history
                  if row["action"] == wait.label)["eligible"], 0)
 
-    def test_predictive_accepts_one_hour_dryer_idle_boundary(self):
-        controller = PredictiveController(SimulationConfig())
+    def test_predictive_accepts_system_dryer_idle_boundary(self):
+        config = SimulationConfig()
+        controller = PredictiveController(config)
         resume = MacroAction(MODE_2C)
         wait = MacroAction(MODE_2C, 6.0)
         outcomes = {
@@ -411,7 +435,8 @@ class ControllerTests(unittest.TestCase):
                 100.0, 110.0, 10.0, 3, 0.0, 0, 10.0, 3),
             wait: ForecastOutcome(
                 100.0, 110.0, 0.0, 0, 6.0, 1, 0.0, 0,
-                maximum_dryer_idle_episode_h=1.0),
+                maximum_dryer_idle_episode_h=(
+                    config.maximum_dryer_idle_episode_h)),
         }
         with patch.object(
                 controller, "_rollout",
@@ -457,6 +482,24 @@ class SimulatorTests(unittest.TestCase):
         }
         values.update(updates)
         return replace(SimulationConfig(), **values)
+
+    def test_field_scenario_generator_is_reproducible_and_controlled(self):
+        generator = FieldScenarioGenerator()
+        first = generator.generate_config(101)
+        repeated = generator.generate_config(101)
+        different = generator.generate_config(202)
+
+        self.assertEqual(first.field_specs, repeated.field_specs)
+        self.assertNotEqual(first.field_specs, different.field_specs)
+        self.assertAlmostEqual(first.total_area_ac, 650.0)
+        self.assertAlmostEqual(first.total_grain_bu, 130000.0)
+        self.assertEqual(
+            sum(field.geometry == "rectangular"
+                for field in first.field_specs), 5)
+        self.assertTrue(all(
+            field.yield_bu_per_ac is not None
+            and field.moisture_pct is not None
+            for field in first.field_specs))
 
     def assert_mass_balance(self, result, config):
         for row in result.time_series:
@@ -514,7 +557,8 @@ class SimulatorTests(unittest.TestCase):
         self.assertEqual(c.stop_work_requirement_h, 6.0)
         self.assertEqual(c.minimum_stop_h, 6.0)
         self.assertEqual(c.stop_signal_confirmation_h, 0.5)
-        self.assertEqual(c.maximum_dryer_idle_episode_h, 1.0)
+        self.assertEqual(c.maximum_dryer_idle_episode_h, 2.0)
+        self.assertTrue(c.use_field_buffer)
         self.assertEqual(c.harvest_completion_tolerance_h, 0.5)
         self.assertEqual(c.minimum_field_engaged_reduction_h, 5.0)
         self.assertEqual(
@@ -553,6 +597,24 @@ class SimulatorTests(unittest.TestCase):
             for sequence in result.metrics["interior_mode_sequence"].split("; ")
             for mode in sequence.split(":", 1)[1].split("->")
         ))
+
+    def test_field_buffer_does_not_change_mode_harvest_rate(self):
+        without_buffer = self.compact_config(
+            n_grain_carts=2, use_field_buffer=False)
+        with_buffer = replace(without_buffer, use_field_buffer=True)
+
+        self.assertEqual(
+            without_buffer.field_buffer_count_for_mode(MODE_1C), 0)
+        self.assertEqual(
+            without_buffer.field_buffer_count_for_mode(MODE_2C), 0)
+        self.assertEqual(
+            without_buffer.field_buffer_count_for_mode(MODE_2C_1GC), 1)
+        for mode in INTERIOR_MODES:
+            self.assertEqual(with_buffer.field_buffer_count_for_mode(mode), 2)
+            self.assertEqual(
+                with_buffer.interior_rate_buph(mode),
+                without_buffer.interior_rate_buph(mode),
+            )
 
     def test_field_specific_properties_override_generator_defaults(self):
         field = FieldSpec(
@@ -658,27 +720,64 @@ class SimulatorTests(unittest.TestCase):
             self.assertLessEqual(
                 len(starts), c.max_interior_mode_switches)
 
-    def test_stop_respects_minimum_productive_work_and_stop_duration(self):
-        c = SimulationConfig()
-        result = Simulator(c, "threshold").run()
-        starts = [row for row in result.time_series
-                  if row["combine_state"] == "STOP_START"]
-        self.assertTrue(starts)
-        self.assertTrue(all(
-            row["productive_since_stop_h"] + c.numerical_tolerance
-            >= c.stop_work_requirement_h for row in starts))
-        self.assertTrue(all(
-            row["stop_request_duration_h"] + c.numerical_tolerance
-            >= c.stop_signal_confirmation_h for row in starts))
-        self.assertGreaterEqual(
-            result.metrics["minimum_observed_planned_stop_duration_h"]
-            + c.numerical_tolerance,
-            c.minimum_stop_h,
+    def test_shared_stop_supervisor_allows_one_stop_per_field_boundary(self):
+        c = replace(SimulationConfig(), stop_work_requirement_h=1.0)
+        moistures = c.sample_field_moistures()
+        for policy in ("threshold", "reactive"):
+            with self.subTest(policy=policy):
+                result = Simulator(c, policy, moistures).run()
+                starts = [row for row in result.time_series
+                          if row["combine_state"] == "STOP_START"]
+                self.assertTrue(starts)
+                self.assertTrue(all(
+                    row["productive_since_stop_h"] + c.numerical_tolerance
+                    >= c.stop_work_requirement_h for row in starts))
+                self.assertTrue(all(
+                    row["stop_work_eligible"] == 1
+                    and row["at_field_start"] == 1
+                    and row["planned_stop_used_current_field"] == 1
+                    for row in starts))
+                stopped_fields = [row["current_field"] for row in starts]
+                self.assertEqual(
+                    len(stopped_fields), len(set(stopped_fields)))
+                self.assertLessEqual(
+                    len(stopped_fields), len(c.field_specs) - 1)
+                self.assertEqual(
+                    result.metrics["planned_stop_location_rule"],
+                    "field_boundary_only")
+                self.assertEqual(
+                    result.metrics["maximum_planned_stops_per_field"], 1)
+                self.assertGreaterEqual(
+                    result.metrics[
+                        "minimum_observed_planned_stop_duration_h"]
+                    + c.numerical_tolerance,
+                    c.minimum_stop_h,
+                )
+                self.assertNotIn(
+                    "HARVEST_REST",
+                    {row["combine_state"] for row in result.time_series},
+                )
+                self.assertLessEqual(
+                    result.metrics[
+                        "maximum_dryer_idle_episode_during_planned_stops_h"],
+                    c.maximum_dryer_idle_episode_h + c.numerical_tolerance,
+                )
+
+    def test_coarse_forecast_step_cannot_cross_dryer_idle_limit(self):
+        c = replace(SimulationConfig(), stop_work_requirement_h=1.0)
+        plan = OpenLoopPlan(
+            tuple(FieldAction(field.field_id, MODE_2C, MODE_2C_1GC)
+                  for field in c.field_specs),
+            stop_on_field_id="F6",
+            stop_duration_h=30.0,
         )
-        self.assertNotIn(
-            "HARVEST_REST",
-            {row["combine_state"] for row in result.time_series},
-        )
+        controller = OpenLoopController(c, plan)
+        result = Simulator(c, controller=controller).run(
+            simulation_step_h=5.0 / 60.0)
+
+        self.assertEqual(result.metrics["number_of_planned_stops"], 1)
+        self.assertLess(
+            result.metrics["planned_stop_time_h"], plan.stop_duration_h)
         self.assertLessEqual(
             result.metrics[
                 "maximum_dryer_idle_episode_during_planned_stops_h"],

@@ -30,6 +30,10 @@ def main() -> None:
     parser.add_argument("--combine-count", type=int, default=defaults.n_combines)
     parser.add_argument("--grain-cart-count", type=int,
                         default=defaults.n_grain_carts)
+    parser.add_argument(
+        "--use-field-buffer", action=argparse.BooleanOptionalAction,
+        default=defaults.use_field_buffer,
+        help="System-wide field-buffer availability for all policies")
     parser.add_argument("--semi-count", type=int, default=defaults.n_semis)
     parser.add_argument("--combine-capacity", type=float,
                         default=defaults.combine_harvest_capacity_buph,
@@ -91,6 +95,7 @@ def main() -> None:
         wet_bin_capacity_bu=args.wet_bin_capacity,
         n_combines=args.combine_count,
         n_grain_carts=args.grain_cart_count,
+        use_field_buffer=args.use_field_buffer,
         n_semis=args.semi_count,
         combine_harvest_capacity_buph=args.combine_capacity,
         grain_cart_harvest_capacity_buph=args.grain_cart_capacity,

@@ -205,13 +205,7 @@ class ThresholdController:
                 return STOP
             return (HARVEST if pressure < self.config.high_pressure_fraction
                     else STOP)
-        available_modes = tuple(state.get(
-            "available_modes", self.config.feasible_modes(INTERIOR_MODES)))
-        current_mode = str(state.get("current_mode", ""))
-        slowest_mode = min(
-            available_modes, key=self.config.interior_rate_buph)
         if (stop_eligible
-                and current_mode == slowest_mode
                 and pressure >= self.config.stop_pressure_fraction):
             return STOP
         return HARVEST
@@ -264,13 +258,18 @@ class ReactiveController:
         harvest_rate = _rate(
             c, phase, geometry, mode, opening_capacity_factor)
         horizon = max(protection_h, c.dt_h)
+        wet_bin_control_reserve_bu = c.wet_bin_control_reserve_bu
         inventory_based_free_bu = max(
             0.0,
             c.total_system_storage_bu
             - (c.wet_bin_capacity_bu - wet_bin_free_bu)
-            - committed_grain_bu,
+            - committed_grain_bu
+            - wet_bin_control_reserve_bu,
         )
-        effective_free_bu = min(system_buffer_free_bu, inventory_based_free_bu)
+        effective_free_bu = min(
+            max(0.0, system_buffer_free_bu - wet_bin_control_reserve_bu),
+            inventory_based_free_bu,
+        )
         total_storage_margin = (
             effective_free_bu
             - max(0.0, harvest_rate - active_dryer_rate_buph) * horizon
@@ -448,7 +447,7 @@ class PredictiveController(ReactiveController):
         def storage_context(mode: str) -> tuple[int, int]:
             return (
                 c.combine_count_for_mode(mode),
-                c.grain_cart_count_for_mode(mode),
+                c.field_buffer_count_for_mode(mode),
             )
 
         def rollout_rate(segment: ForecastSegment, mode: str) -> float:
@@ -1053,9 +1052,9 @@ class PredictiveController(ReactiveController):
             segment.field_id, segment.one_way_travel_min)
         stop_mode = str(state.get("current_mode", mode))
         stop_combine_count = c.combine_count_for_mode(stop_mode)
-        stop_cart_count = c.grain_cart_count_for_mode(stop_mode)
+        stop_cart_count = c.field_buffer_count_for_mode(stop_mode)
         resume_combine_count = c.combine_count_for_mode(mode)
-        resume_cart_count = c.grain_cart_count_for_mode(mode)
+        resume_cart_count = c.field_buffer_count_for_mode(mode)
         minimum_h = c.minimum_stop_h
         maximum_h = min(c.prediction_horizon_h, c.max_simulation_h)
         elapsed_h = 0.0

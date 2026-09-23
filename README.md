@@ -4,14 +4,14 @@
 
 > **When does predictive coordination provide additional value over current-state reactive coordination under downstream constraints?**
 
-完整的研究边界、证据状态、策略定义和 preliminary mechanism experiment 见 [autonomous_harvest_experiment_design.md](autonomous_harvest_experiment_design.md)。当前数据支持的结论、尚未成立的主张、transition-region 解释和 receiving-pit 讨论集中记录在 [PRELIMINARY_FINDINGS.md](PRELIMINARY_FINDINGS.md)。
+本README记录当前代码和当前验证口径。[autonomous_harvest_experiment_design.md](autonomous_harvest_experiment_design.md)与[PRELIMINARY_FINDINGS.md](PRELIMINARY_FINDINGS.md)保留早期研究设计和历史结果，其中的12 h/8 h STOP、15 min控制、48 h Beam等描述不代表当前Rolling Predictive实现。
 
 ## 四种策略
 
 - `fixed`：按给定田块顺序运行；Opening 和 Interior 始终使用当前 Fleet 可支持的最大 capacity；不主动 STOP。
 - `threshold`：只根据当前田间可用储量压力和 wet-bin 占用压力进行分段决策。阈值当前手动设定，后续使用独立 calibration scenarios 优化。
 - `reactive`：只根据 current state 的剩余 buffer、committed grain、当前 harvest/transport/dryer rate 和 response time 决策。
-- `predictive`：在田块和设备信息完全可观测的确定性设定下，克隆当前 Vehicle、卸粮、wet-bin 和 dryer 状态，对 mode 与 planned STOP 组合做滚动时域预测。
+- `predictive`：当前正式验证指`RollingFourFieldPredictive`；它克隆完整物理状态，对当前1 h mode和田界planned STOP做四田滚动预测，未来由动态Reactive tail续算。
 
 `sequential` 和 `adaptive` 仍可作为兼容命令使用，分别映射到 `fixed` 和 `predictive`；新实验与结果应使用四个正式名称。
 
@@ -121,7 +121,7 @@ m(P)=
 \end{cases}
 $$
 
-只有已经处于当前可行的最低速模式，并且 $P\ge\theta_{\mathrm{stop}}$ 的风险信号连续保持 30 min，Threshold 才请求 planned STOP。恢复使用低于 $\theta_2$ 的 hysteresis 条件。
+当 $P\ge\theta_{\mathrm{stop}}$、STOP 工作时钟已经满足、并且系统位于新田开始边界时，Threshold 请求 planned STOP。共享 STOP supervisor 会拒绝田内请求，并保证每田最多一次 planned STOP。STOP 达到最短时长后，当压力低于 $\theta_2$ 时恢复。
 
 ### Reactive strategy 的当前定义
 
@@ -170,101 +170,77 @@ $$
 
 Reactive 选择满足 $M_m^R\ge0$ 的最快可行模式；如果没有模式安全，则先选择最慢可行模式。只有 STOP 资格满足后，才允许进一步选择 planned STOP。
 
-这里的 ETA rollout 只推进决策时已经存在的 committed semi trips，不生成未来收割造成的新装满、发车或下一趟运输，也不读取未来田块、yield 或 moisture。因此它属于 ETA-aware current-state reaction，而不是 Predictive 的多阶段未来模拟。如果包括 `1C` 在内的全部可行模式都不安全，风险信号连续保持 30 min 后才请求 planned STOP；STOP 满足最短时长后，至少一个可行模式重新具有非负 ETA-aware safety margin 才恢复。
+这里的 ETA rollout 只推进决策时已经存在的 committed semi trips，不生成未来收割造成的新装满、发车或下一趟运输，也不读取未来田块、yield 或 moisture。因此它属于 ETA-aware current-state reaction，而不是 Predictive 的多阶段未来模拟。如果在新田块边界包括 `1C` 在内的全部可行模式都不安全，Reactive 请求 planned STOP；田内不允许新建 planned STOP。STOP 满足最短时长后，至少一个可行模式重新具有非负 ETA-aware safety margin 才恢复。
 
-### Predictive strategy 的目标定义
+### Predictive strategy 的当前定义
 
-Predictive 使用 deterministic perfect information：当前固定顺序中所有候选田块的 area、shape、yield、moisture、Opening factor 和 travel time 均已知；Fleet、单车库存、semi event clocks、wet-bin FIFO lots 和 dryer 参数均已知。天气、故障和观测误差留到后续版本。未来库存、车辆运动、堵塞和启停不是外部直接给定，而是由候选控制计划调用与真实系统相同的物理 Simulator 向前演算得到。
+当前正式验证使用 `harvest_sim/rolling_predictive.py` 中的 `RollingFourFieldPredictive`。它与 `Simulator(..., policy="predictive")` 中保留的旧 one-step `PredictiveController` 不同；后者仅用于兼容历史实验，不应与当前 rolling 结果混在一起。
 
-必须区分三个时间尺度：
+所有对外结果统一使用策略名`policy="predictive"`。具体实现另存于`controller_implementation`：当前正式实现为`rolling_four_field_dynamic_tail`，旧兼容实现为`legacy_one_step`。因此分析脚本应先按`policy`比较策略，再用`controller_implementation`检查结果是否来自同一代控制器。
 
-- Simulator 和 Controller 每 1 min 更新、观察一次真实状态；
-- 普通 mode 至少保持 30 min，Predictive 最迟每 30 min 重新规划；planned STOP 仍受 6 h minimum duration 约束；
-- 每次重规划的主动规划窗口为
+Rolling Predictive 使用 deterministic perfect information：当前固定顺序中田块的 area、shape、yield、moisture、Opening factor 和 travel time 均已知；Fleet、单车库存、semi event clocks、wet-bin FIFO lots 和 dryer 参数均已知。`forecast_yield_multiplier`可在验证实验中只修改预测副本里的未完成田块产量，真实仿真仍使用原始产量。
 
-$$
-H_P=48\ \mathrm{h}.
-$$
+#### 滚动预测与动态 tail
 
-如果当前真实时间为 $t$，Predictive 研究 $[t,t+H_P]$ 内的 mode 与 planned-STOP 安排，但真实系统只执行所选路径的第一个动作。到下一个合法决策点后，Controller 从新的真实状态再次向前滚动 48 h。48 h 是主动规划窗口，不是单个动作持续时间，也不是整个仿真时长。
-
-#### Forecast 与真实 Simulator
-
-Forecast 是 Predictive 内部从当前真实状态克隆出的假设未来；real simulation 是最终产生实验结果的主仿真。两者必须调用同一套 Field、Vehicle、transport、wet-bin、dryer、mode-switch 和 STOP 物理逻辑：
+每次决策从完整 `SimulationCheckpoint` 克隆未来状态，使用与真实系统相同的 Field、Vehicle、transport、wet-bin、dryer、mode-switch 和 STOP 物理逻辑：
 
 $$
 \text{Forecast physics}=\text{Real-simulation physics}.
 $$
 
-在相同初始状态和相同 open-loop action sequence 下，两者必须得到一致的单车库存、semi event、wet-bin、dryer、forced/planned STOP 和完成时间。每个预测 node 保存一个互相独立的完整系统状态快照，包括田块剩余量、每台 Vehicle 的载粮与状态、semi 的位置和 ETA、wet-bin FIFO lots、dryer 状态、当前 mode、minimum-dwell/mode-switch 约束以及 STOP 时钟。预测分支不得修改真实状态或其他分支。
+当前时间尺度和搜索范围为：
 
-#### 48 h 以后的真实 tail rollout
+- 真实执行使用 1 min 物理步长；forecast 默认使用 5 min 物理步长；
+- 每次只提交当前 1 h root action；若先到田界，则在田界立即重新规划；
+- 每次评估当前田和后续三块未完成田，共最多四田；
+- 普通 Interior mode 至少保持 30 min，每田最多切换两次；
+- tail 每 1 h或到达田界重新选择最快的 current-state-safe mode，并在后续合法田界再次允许 STOP；
+- 预测推进到本次四田窗口全部完成，不使用乐观 terminal estimate。
 
-旧的乐观 terminal estimate
+因此，当前实现不是48 h多层Beam Search。`prediction_horizon_h`和`predictive_beam_width`仍由旧控制器使用，但不决定 `RollingFourFieldPredictive` 的四田动态-tail搜索。
 
-$$
-T_{\mathrm{tail}}\approx
-\frac{\text{remaining grain}}{\text{theoretical maximum harvest rate}}
-$$
+#### Root action 与 STOP 搜索
 
-忽略了未来 semi 循环、wet-bin 堵塞、forced blocking、planned STOP 和后续田块转换，因此必须删除。每个保留到 48 h 边界的 leaf node 改由固定的 Threshold tail policy 接管，并继续调用完整 Simulator，直到 harvest completion 和 system completion。Tail policy 是对候选后果的真实续算，不是代数估计；它使所有 leaf 使用相同的可解释 fallback 进行公平比较。
+Root action 枚举当前阶段合法的 `1C / 2C / 2C+1GC`。只有在新田开始、STOP工作时钟满足且本田尚未使用过planned STOP时，才额外比较带STOP的root action。默认STOP搜索为：
 
-有了完整 tail rollout，目标设计不再因 48 h 边界处于 STOP/blocking 而自动把主动规划窗口延长到 72 h。以后可把 $H_P\in\{24,48,72\}\ \mathrm{h}$ 作为独立敏感性实验，但第一版固定 $H_P=48\ \mathrm{h}$。
+1. 从6 h开始，每4 h粗搜到30 h；
+2. 在粗搜优胜点两侧用1 h步长细化；
+3. 再用0.25 h步长细化。
 
-#### 压力引导的 Beam Search
+共享 STOP supervisor 对所有策略统一执行“仅田界启动、每田最多一次、最短6 h、dryer连续缺粮不超过系统上限”的约束。当前 rolling/validation runners把STOP资格设为累计1 h实际收获；`SimulationConfig`通用默认值仍为6 h。
 
-若把 `1C / 2C / 2C+1GC / STOP` 每 30 min 完全展开，48 h 内最多形成 $4^{96}$ 条动作序列，因此目标不是穷举全局最优，而是在保证每条被评估路径物理正确的前提下，保留有希望的路径。
+#### 动态完成时间容差与候选排序
 
-搜索在每个 node 上使用该 node 自己的田间可用储量压力 $P_{\mathrm{field}}$ 和 wet-bin 占用压力 $P_{\mathrm{wetbin}}$ 生成少量候选动作：低压力主要向高速模式搜索；中压力保留当前模式及相邻快/慢模式；高压力主要向 `1C` 和 `STOP` 搜索，同时保留一个相邻的较快模式，避免过早剪掉能够防止 dryer 缺粮的恢复路径。压力负责生成候选，不直接代替完整 rollout 的最终评价。
-
-物理状态仍每分钟推进；搜索树在 mode 最短保持时间结束、压力区间改变、关键 semi 到达/离开、田块完成、全体 combine 接近 blocked、STOP 可开始或可恢复等有决策意义的事件处扩展。这里的“扩展”是从一个预测状态分别执行其合法候选动作，从而产生下一层预测状态。
-
-每一层依次执行：
-
-1. 删除违反 Fleet 数量、Opening/Interior mode-switch、minimum dwell、STOP 或 dryer 连续供粮约束的 node；
-2. 删除在 harvested grain、meaningful forced-block time、planned-STOP 使用和库存安全性上均不优于另一 node 的被支配状态；
-3. 对时间、剩余田块、$P_{\mathrm{field}}$、$P_{\mathrm{wetbin}}$、semi 位置/ETA 和 mode 足够接近的状态做近似去重，只保留表现更好的一个；
-4. 若剩余状态仍过多，最多保留 `predictive_beam_width` 个 node。
-
-`predictive_beam_width=50` 只是防止计算量失控的可调上限，不表示有 50 种动作，也不是物理参数。搜索动作仍由压力状态和合法性产生。
-
-#### 候选排序与滚动执行
-
-令 $\widehat T_a$ 为候选计划 $a$ 经过 48 h Predictive planning 加完整 Threshold tail 后的预计 harvest completion time，先求
+令最快候选的四田预测完成时间和raw forced blocking分别为 $T_\star$ 与 $B_\star$。当前容差为
 
 $$
-\widehat T_{\min}=\min_a \widehat T_a.
+r_\star=\frac{B_\star}{T_\star},\qquad
+\alpha=\operatorname{clip}(0.01+0.30r_\star,0.01,0.04).
 $$
 
-只保留满足
+先保留满足
 
 $$
-\widehat T_a\le \widehat T_{\min}+30\ \mathrm{min}
+T_a\le T_\star(1+\alpha)
 $$
 
-的近最短计划；随后依次最小化 meaningful forced-block time、planned-STOP 启动次数和 system completion time。最后以较高的当前 harvest rate 和较短的等待作为 deterministic tie breakers。这样 planned STOP 不能通过无限延长停机来“消除” forced stop。真实系统只执行最佳候选的第一个动作，之后使用新的真实状态再次预测。
+的候选，再依次最小化：raw forced blocking、planned STOP期间dryer idle、planned STOP总时长、STOP次数、mode switches、预测完成时间和期末未处理库存。真实系统只执行最佳候选的第一个root action，之后从新的真实状态重新预测。
 
-> **实现状态：**代码已删除 48--72 h 自动扩展和乐观 terminal estimate。当前可验证版本采用 one-step rollout：压力引导生成当前候选，候选动作保持一个30 min决策间隔，之后立即由 Threshold 规则和完整逐车物流模型续算到 harvest/system completion。因此未来启停是物理模拟结果，但主动优化前缀目前只有30 min。把主动规划前缀扩展到完整48 h仍需要可复用的多层 Beam node、支配剪枝和相似状态合并；在该状态重构完成前，`predictive_beam_width`只是当前 macro-action frontier 的候选上限，不能把当前代码称为完整多层 Beam Search。
+这意味着1%--4%是每次四田局部预测的容差，不是对全季完工时间的硬保证。当前控制器会在局部容差允许时，用planned STOP换取更少的unplanned blocking。
 
-**重写的第一步（已实现）：**`harvest_sim/open_loop.py` 提供指定田块模式和一次STOP请求的 `OpenLoopPlan`。`Simulator.run(checkpoint_at_h=...)` 在下一物理步边界保存完整运行检查点；`forecast_plan(checkpoint, plan)`从副本继续使用真实Simulator推进。两田测试覆盖收割中、6 h STOP中和恢复后的检查点：相同计划的完整时间轨迹、逐车事件和指标与不中断的真实运行一致；不同计划不会修改原检查点。预先计划的田块边界STOP在满足工作资格和dryer保护后立即开始；普通控制器请求仍需30 min确认。
+#### Field buffer、dryer idle 与95% wet-bin reserve
 
-**四田滚动版本（已实现并完成10田试跑）：**`RollingFourFieldPredictive`每次读取完整检查点，向前模拟当前田和后续三块未完成田，只执行当前1 h动作后重新计算；换田时也立即重新计算。每块田以`2C+1GC`开始，田内最多切换两次并保持至少30 min。当前使用6类可解释的田块速度组合，并只在田块边界比较不STOP及6/10/14/18 h STOP。预测用5 min物理步长，真实执行仍用1 min步长。计划先保留不超过最快方案2 h的候选，再依次最小化raw forced blocking、STOP次数、模式切换、完成时间和期末库存。它是可运行的滚动多田预测原型，不是穷举Beam Search；候选速度组合、STOP位置及局部2 h容差仍需继续扩展和验证。
+`use_field_buffer=True`和`maximum_dryer_idle_episode_h=2`属于共享`SimulationConfig`，不是Predictive特权。启用field buffer后，全部`N_graincart`即使不贡献当前mode的收获速度，也可作为田间临时储粮；这也是以后grain bag接口的基础。
 
-默认10田场景、STOP资格改为累计1 h实际收获后的首次结果为：188.57 h完成收获，raw forced blocking为3.16 h，9次planned STOP合计126.05 h，11次田内模式切换。相同配置下Threshold为196.16 h、1.22 h、20次STOP；Reactive为193.11 h、1.01 h、23次STOP；Fixed为186.55 h、148.18 h、0次STOP。该版本把大量不可控堵塞转化为较少的长休息，并比Threshold和Reactive更早完成；相对Fixed仍晚2.02 h，且局部四田窗口的2 h容差不能保证全程差值严格小于2 h。完整输出保存在`results/current/rolling_four_field_predictive/`。
+`wet_bin_control_limit_fraction=0.95`不会把物理wet bin从10,000 bu改成9,500 bu，而是在Reactive及其Rolling tail的安全余量中预留500 bu。当前验证套件在field-configuration、downstream-capacity和forecast-error三类实验中统一使用该95%控制上限；旧结果若使用1.0，必须重跑后才能与新口径合并分析。
 
-#### 首次10田运行的 forced-blocking 诊断
+使用以下命令运行当前rolling版本：
 
-以下诊断使用全部10块田的逐分钟`timeseries.csv`，不是单个四田预测窗口。把所有`combine_state=BLOCKED`记录的`duration_h`相加得到3.1593 h raw forced blocking；连续记录合并后共有21次事件，其中10次持续至少0.1 h，合计2.5955 h meaningful forced blocking，另外11次短事件合计0.5639 h。
+```bash
+python run_rolling_predictive.py --verbose
+```
 
-按堵塞发生时的直接系统状态分类：wet bin已达到10000 bu容量的记录合计0.9492 h；wet bin未满但田间没有semi的记录合计2.2101 h；没有剩余其他类型。按当时模式分类，`1C`期间发生2.7867 h，占88.2%；`2C+1GC`期间发生0.3726 h。F2单田发生1.2326 h，其中0.9492 h来自wet bin装满。
-
-主要机制不是dryer总吞吐被严重低估，而是当前模式同时绑定收获速度和田间buffer。`1C`不使用grain cart，只有一台combine的300 bu储粮；在1600 bu/h下约11.25 min即可装满。当三辆semi同时离开田间时，即使运输的长期平均能力足够，也会产生短时forced blocking。第二个机制是planned STOP当前严格限制在田块边界，且本次运行只比较到18 h；F2开始前18 h STOP把wet bin从10000 bu降到约2343 bu，但该空间仍不足以支持F2完成，田中又不能主动等待，因此最终forced blocking。
-
-四田Forecast本身也还没有完整的多阶段动作序列。每个候选为每块田指定一个Interior模式，并最多在当前田块边界安排一次STOP；它不能在同一次预测中表达“全速30 min→降速→田界STOP→下一田恢复全速”，也不安排预测窗口内后续田界的STOP。第一次决策所选候选因此仍预测四田内34.15 h raw blocking，真实执行依靠后续53次重新规划逐步修正。5 min预测步长不是当前主要误差来源：第一次决策改用1 min步长后相同候选预测34.13 h，仅相差0.02 h。
-
-下一版应优先扩展动作结构：允许低收获速度同时保留grain cart提供buffer；根据剩余田块粮量、dryer速度和目标模式动态计算超过18 h的必要STOP长度；在四田窗口内显式搜索田内变速和多个田界STOP。之后再考虑把1 h重新规划间隔缩短为30 min。以上分类描述堵塞发生时的直接状态；各项修改能减少多少blocking仍需通过独立对照运行确认。
-
-使用 `python run_rolling_predictive.py --verbose` 可按相同默认参数重新运行。当前机器上的完整10田试跑约需4分钟；可用`--output-dir`指定新的结果目录，避免覆盖已有结果。
+默认10田完整运行约需数分钟到十余分钟，取决于场景和候选数量；可用`--output-dir`避免覆盖已有结果。
 
 ## Version 1 物理模型契约
 
@@ -274,7 +250,7 @@ $$
 
 每块田严格按 `Opening -> Interior` 完成。Opening 到 Interior 不增加额外转换时间，该影响已经包含在田间有效 capacity 中。田块之间使用统一的 `field_switch_time_h`；换田时不生产新粮，但车辆运输、卸粮和 dryer 继续推进。
 
-当前田块属性由人工输入或带固定 random seed 的 `FieldGenerator` 生成。所有 matched policies 必须共享同一组已经生成的田块；未来可用由真实田块信息推导 shape、Opening area/fraction 和 Opening capacity factor 的模型替换 generator。
+当前田块属性可由人工输入、基础 `FieldGenerator`，或带固定seed的完整 `FieldScenarioGenerator` 生成。后者同时随机化面积、亩产、shape、单程运输时间和moisture，并把每套场景归一化到650 ac和130,000 bu。所有matched policies必须共享同一组已经生成的田块；未来可用真实田块数据替换synthetic generator。
 
 ### Vehicle、Fleet 与 OperatingMode
 
@@ -350,30 +326,24 @@ $$
 令 $W(t)$ 为上次 planned STOP 结束后累计的 STOP 资格时钟，则
 
 $$
-W(t)=T_H(t)+T_B(t)+T_M(t).
+W(t)=T_H(t).
 $$
 
-`FIELD_SWITCHING`、`PLANNED_STOP` 和 `POST_HARVEST` 不计入 $W$。当 $W$ 达到可调参数 `stop_work_requirement_h` 后，strategy 才有资格提交 STOP risk signal。信号必须连续保持
+Forced blocking、mode switching、`FIELD_SWITCHING`、`PLANNED_STOP` 和 `POST_HARVEST` 均不计入 $W$。当 $W$ 达到可调参数 `stop_work_requirement_h` 后，strategy 才有资格在下一个田块边界提交一次 STOP 请求。共同的 STOP supervisor 强制执行“只在新田开始前STOP、每个田最多一次”、最短时长和dryer连续性约束；一旦开始收获该田，本田不再接受planned STOP。Threshold、Reactive 和 Predictive 分别用 pressure、committed semi ETA 和未来物理rollout决定在这个边界是否停机。
 
-$$
-T_{\mathrm{confirm}}=0.5\ \mathrm{h}
-$$
-
-才开始 planned STOP，瞬时压力跳变不会直接停机。Threshold、Reactive 和 Predictive 分别用 pressure、committed semi ETA 和 48 h pressure-guided rollout 计算 risk/resume signal；共同的 STOP supervisor 只执行资格、确认时间和物理约束。Predictive 的 48 h leaf 必须通过完整 Threshold tail 续算到系统完成，不得使用乐观 terminal estimate。
-
-每次 planned STOP 至少持续 `minimum_stop_h=6 h`，结束后 $W$ 归零。STOP 只停止新粮生产；partial semi 可发车，combine、cart 和 semi 中已有粮食继续转移，已发车 semi 继续行驶，单卸粮位继续按 FIFO 工作，dryer 继续运行。若当前田能够在出现 forced blocking 前安全完成，田块完成边界可以作为开始 STOP 的软偏好；当前版本保留该接口语义，但尚未为它设置独立 objective penalty，因此它不是 hard constraint，也不会覆盖防堵和 dryer 约束。
+每次 planned STOP 至少持续 `minimum_stop_h=6 h`，同一次STOP可以继续延长，但恢复收获后不能在同一田再次STOP。STOP结束后 $W$ 归零。STOP 只停止新粮生产；partial semi 可发车，combine、cart 和 semi 中已有粮食继续转移，已发车 semi 继续行驶，单卸粮位继续按 FIFO 工作，dryer 继续运行。
 
 Dryer 从第一次实际处理粮食开始，到 system completion 之前，因缺粮造成的任一连续停机 episode 满足
 
 $$
-\max_k T_{\mathrm{dryer,idle},k}\le1\ \mathrm{h}.
+\max_k T_{\mathrm{dryer,idle},k}\le2\ \mathrm{h}.
 $$
 
-第一次来粮以前的 startup waiting 和全部粮食处理完成后的时间不计入该 episode。Planned STOP 启动前，STOP supervisor 会在复制的逐车物流状态上检查：至少6 h STOP 不会突破此上限；STOP 满6 h 后，如果 dryer 缺粮 episode 已达到1 h 上限，则强制恢复。Predictive 还会把恢复收割后新粮到达 wet bin 的延迟放入完整 rollout。Wet bin 不需要清空；相反，恢复必须发生在继续停止会使 dryer 长时间断粮以前。
+第一次来粮以前的 startup waiting 和全部粮食处理完成后的时间不计入该 episode。Planned STOP 启动前，STOP supervisor 会在复制的逐车物流状态上检查：至少6 h STOP 不会突破此上限；STOP 满6 h 后，如果dryer缺粮episode已达到2 h上限，则强制恢复。Predictive还会把恢复收割后新粮到达wet bin的延迟放入完整rollout。Wet bin不需要清空；相反，恢复必须发生在继续停止会使dryer长时间断粮以前。
 
 ### 时间分辨率、日志与完成条件
 
-Simulator 和 Controller 默认每 1 min 更新一次。状态 snapshot 默认每 5 min 写一次，可改为 15 min；状态变化事件立即写入独立 event log。质量守恒和容量上限仍每分钟检查，不依赖 snapshot 频率。
+Simulator默认每1 min推进物理状态，Fixed/Threshold/Reactive按系统control interval读取状态；Rolling Predictive每1 h或田界重新选择root action，其内部forecast默认用5 min步长。状态snapshot默认每5 min写一次，可改为15 min；质量守恒和容量上限仍按实际物理步长检查。
 
 `harvest completion` 是所有 Field 的 Opening 和 Interior 完成的时间。此后 partial semi 全部发车，下游继续运行。`system completion` 是所有 Vehicle、receiving pit 和 wet bin 均为空且全部粮食完成 dryer 处理的时间。
 
@@ -416,7 +386,7 @@ T_{\mathrm{dryer,idle}}
 =T_{\mathrm{system\ completion}}-T_{\mathrm{dryer,operating}}.
 $$
 
-其中 `dryer_idle_time_h` 包含第一次来粮以前的 startup waiting；另行报告的 `dryer_starvation_time_after_start_h`、`maximum_dryer_idle_episode_h` 和 `maximum_dryer_idle_episode_during_planned_stops_h` 排除 startup waiting，用于检查1 h连续停机约束。
+其中 `dryer_idle_time_h` 包含第一次来粮以前的 startup waiting；另行报告的 `dryer_starvation_time_after_start_h`、`maximum_dryer_idle_episode_h` 和 `maximum_dryer_idle_episode_during_planned_stops_h` 排除startup waiting，用于检查2 h连续停机约束。
 
 ## 当前基线
 
@@ -431,16 +401,15 @@ $$
 | Semis | 3 × 1,000 bu |
 | Receiving pit | 无 |
 | Grain leg | 3,000 bu/h；满载 semi 名义卸粮 20 min |
-| Wet bin | 10,000 bu |
+| Wet bin | 10,000 bu物理容量；通用control reserve默认0，capacity suite使用500 bu reserve |
 | Dryer | continuous FIFO；暂用 `D(M)=2600-100M`，`M=18–22%` |
-| STOP | 资格时钟累计 ≥6 h；risk signal 连续30 min；每次至少6 h |
-| Dryer continuity | startup 后单次缺粮停机 ≤1 h；STOP 前做6 h feasibility guard |
+| STOP | 资格时钟只累计实际收获；通用默认6 h，当前rolling/validation实验使用1 h；仅新田边界可启动；每田最多1次；每次至少6 h |
+| Dryer continuity | startup 后单次缺粮停机 ≤2 h；所有策略读取同一系统上限 |
 | Forced STOP deadband | ≤0.1 h 的连续堵塞事件保留在raw trace，但不计入meaningful forced指标 |
-| Predictive search | 压力引导候选；关键事件扩展；支配/相似状态剪枝；beam-width cap 50 |
-| Simulation / control update | 每 1 min |
+| Predictive search（当前） | 当前+后续三田；1 h root action；动态Reactive tail；STOP粗搜+双向细化 |
+| Simulation / control update | 真实物理1 min；rolling决策1 h或田界；forecast物理步长5 min |
 | Reactive mode safety horizon | 1 h；horizon 内使用当前 committed semi ETA |
-| Predictive rollout（当前） | 当前动作主动规划30 min；随后使用 Threshold 和完整物流模型续算到完成；不使用 terminal estimate |
-| Predictive rollout（目标） | 多层Beam主动规划48 h；leaf 使用同一 Threshold tail 续算到完成 |
+| Predictive rollout（当前） | root action后由fastest-safe Reactive tail推进到四田窗口完成；不使用terminal estimate |
 
 STOP 是 system scheduling action，不是 field mode：只停止新粮生产，combine/cart/semi 中已有粮食仍可转运，grain leg 和 dryer 继续运行。Planned STOP 与 forced blocking 分开报告。
 
@@ -452,25 +421,29 @@ STOP 是 system scheduling action，不是 field mode：只停止新粮生产，
 python run_baseline.py --policy fixed
 python run_baseline.py --policy threshold
 python run_baseline.py --policy reactive
-python run_baseline.py --policy predictive
-python run_experiments.py
-python run_experiments.py --joint-capacity-mechanism `
-  --joint-capacity-scales 1 2 4 --joint-buffer-scales 1
+python run_rolling_predictive.py --verbose
+python run_validation_suite.py --phase all --skip-existing
 python -m unittest discover -s tests -v
 ```
+
+`run_baseline.py --policy predictive`仍可运行旧one-step `PredictiveController`，但当前正式rolling结果应使用`run_rolling_predictive.py`或`run_validation_suite.py`。`run_experiments.py`保留用于复现早期mechanism experiments，不作为当前验证套件入口。
 
 `run_baseline.py` 运行一个策略并保存完整数据：
 
 - `metrics.json`
 - `timeseries.csv`
 - `transport_events.csv`
-- `controller_decisions.csv`（Predictive 每次决策的全部候选、预测结果、可选性和最终选择）
+- `controller_decisions.csv`（仅旧Predictive controller）
 - `daily_machine_hours.csv`
 - `overview.svg`
 - `first_3h.svg`
 - scenario-level `field_scenario.csv`
 
-`run_experiments.py` 在同一个 moisture realization 上比较四种策略，输出：
+`run_rolling_predictive.py`保存`metrics.json`、完整`timeseries.csv`、`field_scenario.csv`和当前rolling版本的`controller_decisions.csv`。后者逐次记录候选数量、局部最快时间、动态alpha、STOP/no-STOP预测以及最终root action。
+
+验证套件的`scenario_metadata.json`还固定记录wet-bin物理容量、控制上限比例与reserve，以及Rolling Predictive的实现ID、1 h决策间隔、四田horizon、5 min forecast步长、alpha范围和三级STOP搜索参数。单次运行的`metrics.json`使用统一的`policy`名称，并用`controller_implementation`区分当前rolling实现与legacy one-step实现。
+
+历史`run_experiments.py`在同一个moisture realization上比较四种旧版策略，输出：
 
 - `policy_comparison.csv`
 - `machine_hours_summary.csv`
@@ -480,7 +453,58 @@ python -m unittest discover -s tests -v
 
 结果默认写入 `results/current/` 下带完整参数的场景目录，不覆盖旧命名的结果。
 
-## Preliminary mechanism experiment
+## FieldScenarioGenerator 与验证套件
+
+`FieldScenarioGenerator` 用 seed 生成完整田块场景，而不再只改变湿度。它会随机化每块田的面积、亩产、形状、单程转场时间和湿度，同时把每套场景归一化到相同的 650 ac 和 130,000 bu，便于公平比较。
+
+```bash
+python run_validation_suite.py --phase generate
+python run_validation_suite.py --phase field --skip-existing
+python run_validation_suite.py --phase pressure --skip-existing
+python run_validation_suite.py --phase error --skip-existing
+```
+
+- `field`：在S1/S2/S3上分别运行Fixed、Threshold、Reactive和当前Rolling Predictive。三套场景保持相同总面积和总粮量，但田块面积、亩产、shape、距离和moisture不同。
+- `pressure`（或 `capacity`）：固定S2，配对运行四种策略，把dryer curve、grain-leg rate和名义semi卸粮能力同步放大`1 / 1.2 / 1.5 / 1.8 / 2 / 2.5 / 3×`。倍数越大，downstream越强、压力越小。该套件保持10,000-bu物理wet bin，并在Reactive/Predictive安全余量中保留500 bu；Threshold仍使用自身95% occupancy STOP阈值，Fixed不读取状态安全余量。
+- `error`：固定真实S2，只令Rolling Predictive对未完成田块的预测产量产生`-5% / +5%`系统偏差；真实收获量不变。当前error suite尚未启用capacity suite的500-bu reserve。
+
+完整轨迹写入 `results/validation/`。紧凑汇总写入 `results/validation/summary/` 下的 `scenarios.csv`、`field_configurations.csv`、`downstream_capacity.csv` 和 `forecast_error.csv`。
+
+Forecast-error套件会独立运行`-5% / 0% / +5%`三组预测产量误差，分别写入`yield_m5pct`、`yield_0pct`和`yield_p5pct`。其中0%基线不再借用field-configuration套件的S2结果，从而保证三组使用完全相同的实验配置与输出流程。
+
+### 当前验证结果
+
+S1/S2/S3的Reactive与Rolling Predictive结果为：
+
+| Scenario | Reactive harvest (h) | Predictive harvest (h) | Reactive raw block (h) | Predictive raw block (h) | Predictive planned STOP (h) |
+|---|---:|---:|---:|---:|---:|
+| S1 | 202.00 | 202.16 | 78.76 | 0.54 | 141.07 |
+| S2 | 211.14 | 211.67 | 88.53 | 1.00 | 156.32 |
+| S3 | 240.49 | 238.42 | 113.68 | 1.88 | 176.79 |
+
+三套场景均显示：Predictive把大量constraint-induced forced blocking转化为田界planned STOP和更集中的高速收获，但没有稳定缩短system completion。当前证据支持“提高运行可控性”，不支持“普遍提高物理吞吐能力”。
+
+S2 downstream-capacity sweep的主比较为：
+
+| Scale | $\rho=Q_{\max}/Q_{\mathrm{downstream}}$ | Predictive − Reactive harvest (h) | Reactive − Predictive raw block (h) | Predictive STOP (h) |
+|---:|---:|---:|---:|---:|
+| 1.0 | 7.06 | +0.54 | 87.53 | 156.32 |
+| 1.2 | 5.88 | +2.82 | 55.14 | 115.04 |
+| 1.5 | 4.71 | +1.25 | 33.66 | 86.79 |
+| 1.8 | 3.92 | 0.00 | 26.23 | 62.82 |
+| 2.0 | 3.53 | −0.17 | 21.52 | 49.81 |
+| 2.5 | 2.82 | +1.01 | 7.68 | 33.54 |
+| 3.0 | 2.35 | −0.36 | 5.44 | 18.29 |
+
+`+`表示Predictive收获更慢，`−`表示更快。当前1--3×全部满足$\rho>2$，因此仍是binding downstream conditions；真正接近nonbinding需要约7×，尚未用当前版本验证。
+
+2×和3×下Predictive确实更多使用快速田间动作。2×时其Interior `2C+1GC` productive time为10.16 h，Reactive仅0.56 h；3×时分别为11.74和2.16 h。Predictive的田间作业时间分别比Reactive短43.97和18.65 h，但额外planned STOP分别为43.81和18.29 h，所以最终harvest completion只快0.17和0.36 h。逐分钟堵塞分类还表明，Predictive在2×/3×下因田间无semi造成的blocking仅0.31/0.07 h；主要长期上限仍是wet bin与dryer，而不是transportation。
+
+Forecast-yield误差的当前S2结果为：`-5% / 0 / +5%`对应raw blocking `1.99 / 1.00 / 6.81 h`。+5%误差会让预测认为田内仍有更长时间供dryer排空，从而缩短部分田界STOP；真实田块更早结束后，下一个高速田块更容易遇到高库存。该结果说明误差响应具有方向性，但在统一95% reserve后仍需重跑确认。
+
+## 历史 preliminary mechanism experiment
+
+本节用于复现旧dryer/buffer机制实验。它使用早期Predictive controller及不同STOP/决策口径，不能与当前rolling validation直接合并。
 
 ```bash
 python run_experiments.py --mechanism
@@ -504,43 +528,27 @@ python run_experiments.py --joint-capacity-mechanism
 dryer-only结果。每个策略保存metrics、timeseries、transport events、daily
 machine-hours和overview图；`RUN_RECORD.md`记录精确参数、结果和限制。
 
-## 常用覆盖参数
+## 当前 Rolling Predictive 常用参数
 
 ```bash
-python run_baseline.py --policy predictive `
-  --wet-bin-capacity 10000 `
-  --grain-leg-rate 3000 `
-  --combine-count 2 `
-  --grain-cart-count 1 `
-  --semi-count 3 `
-  --combine-capacity 1600 `
-  --grain-cart-capacity 800 `
-  --seed 42 `
-  --moisture-min 18 `
-  --moisture-max 22 `
-  --dryer-intercept 2600 `
-  --dryer-slope 100 `
-  --opening-fraction 0.15 `
-  --mode-dwell-min 30 `
-  --max-mode-switches 2 `
-  --mode-switch-time-min 5 `
-  --decision-interval-min 1 `
-  --predictive-decision-interval-min 30 `
-  --predictive-beam-width 50 `
-  --prediction-horizon-h 48 `
-  --work-before-stop-h 6 `
-  --minimum-stop-h 6 `
-  --stop-confirmation-min 30 `
-  --maximum-dryer-idle-h 1 `
-  --forced-block-ignore-h 0.1 `
-  --harvest-tolerance-h 0.5 `
-  --minimum-field-reduction-h 5 `
-  --field-order-rule far_to_near `
-  --name-suffix trial
+python run_rolling_predictive.py `
+  --decision-interval-h 1 `
+  --forecast-step-min 5 `
+  --horizon-fields 4 `
+  --completion-tolerance-min-pct 1 `
+  --completion-tolerance-max-pct 4 `
+  --completion-tolerance-pressure-scale 0.30 `
+  --work-before-stop-h 1 `
+  --maximum-stop-h 30 `
+  --stop-coarse-step-h 4 `
+  --stop-refine-step-h 1 `
+  --stop-fine-step-h 0.25 `
+  --maximum-dryer-idle-h 2 `
+  --use-field-buffer `
+  --output-dir results/current/rolling_dynamic_predictive
 ```
 
-以上是 PowerShell 的续行写法；也可以写成一行。
-`--harvest-tolerance-h`直接定义 Predictive 的 near-shortest completion band；`--minimum-field-reduction-h`保留为探索性结果口径，不进入当前在线排序。
+以上是PowerShell续行写法。`--stop-durations-h`可传入逗号分隔的固定候选；默认`auto`使用粗到细搜索。物理系统参数仍集中在`SimulationConfig`；validation suite通过不可变config副本构造配对实验。
 
 ## 物理流和守恒
 

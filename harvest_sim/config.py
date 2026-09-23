@@ -78,6 +78,11 @@ class SimulationConfig:
     n_combines: int = 2
     n_grain_carts: int = 1
     n_semis: int = 3
+    # When enabled, every configured grain cart remains available as field
+    # storage even when the selected operating mode does not use it for a
+    # harvest-rate contribution. This is the first generic field-buffer
+    # interface; future grain bags can extend it without changing mode rates.
+    use_field_buffer: bool = True
     combine_harvest_capacity_buph: float = 1600.0
     grain_cart_harvest_capacity_buph: float = 800.0
     combine_storage_capacity_bu: float = 300.0
@@ -89,12 +94,13 @@ class SimulationConfig:
     interior_mode_switch_time_h: float = 5.0 / 60.0
     field_switch_time_h: float = 20.0 / 60.0
 
-    # STOP eligibility counts productive harvesting accumulated since the
-    # previous planned STOP. Forced blocking and mode switching do not count.
+    # STOP work eligibility counts productive harvesting accumulated since
+    # the previous planned STOP. The shared supervisor additionally requires
+    # a new-field boundary and permits at most one planned STOP per field.
     stop_work_requirement_h: float = 6.0
     minimum_stop_h: float = 6.0
     stop_signal_confirmation_h: float = 30.0 / 60.0
-    maximum_dryer_idle_episode_h: float = 1.0
+    maximum_dryer_idle_episode_h: float = 2.0
     forced_block_ignore_h: float = 0.1
     planned_stop_extension_options_h: tuple[float, ...] = (0.5, 1.0)
     harvest_completion_tolerance_h: float = 30.0 / 60.0
@@ -117,6 +123,9 @@ class SimulationConfig:
     receiving_pit_capacity_bu: float = 0.0
     grain_leg_rate_buph: float = 3000.0
     wet_bin_capacity_bu: float = 10000.0
+    # Controllers can reserve the top of the physical wet bin for forecast
+    # and transport uncertainty without changing the physical capacity.
+    wet_bin_control_limit_fraction: float = 1.0
     dryer_intercept_buph: float = 2600.0
     dryer_moisture_slope_buph_per_pct: float = 100.0
 
@@ -192,6 +201,9 @@ class SimulationConfig:
         if not 0 <= self.low_pressure_fraction < self.high_pressure_fraction < self.stop_pressure_fraction <= 1:
             raise ValueError(
                 "Pressure thresholds must satisfy 0 <= low < high < stop <= 1")
+        if not 0 < self.wet_bin_control_limit_fraction <= 1:
+            raise ValueError(
+                "wet_bin_control_limit_fraction must be in (0, 1]")
         if self.default_field_order_rule not in (
                 "far_to_near", "near_to_far", "listed"):
             raise ValueError("Unknown default_field_order_rule")
@@ -284,6 +296,11 @@ class SimulationConfig:
             + self.receiving_pit_capacity_bu
             + self.wet_bin_capacity_bu
         )
+
+    @property
+    def wet_bin_control_reserve_bu(self) -> float:
+        return self.wet_bin_capacity_bu * (
+            1.0 - self.wet_bin_control_limit_fraction)
 
     # Compatibility read-only names used by plotting/result code.
     @property
@@ -413,6 +430,18 @@ class SimulationConfig:
 
     def grain_cart_count_for_mode(self, mode: str) -> int:
         return self.mode(mode).n_grain_carts
+
+    def field_buffer_count_for_mode(self, mode: str) -> int:
+        """Return grain-cart-backed buffers available to ``mode``.
+
+        ``grain_cart_count_for_mode`` controls productive capacity. This
+        method controls temporary field storage, so low-rate modes can retain
+        buffers without receiving a grain-cart harvest-rate contribution.
+        """
+        self.mode(mode)  # Validate even when every cart is a buffer.
+        if self.use_field_buffer:
+            return self.n_grain_carts
+        return self.grain_cart_count_for_mode(mode)
 
     def grain_cart_enabled_for_mode(self, mode: str) -> bool:
         return self.grain_cart_count_for_mode(mode) > 0

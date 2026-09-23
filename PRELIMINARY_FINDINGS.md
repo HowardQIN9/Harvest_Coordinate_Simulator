@@ -1,5 +1,11 @@
 # Preliminary Findings and Current Interpretation
 
+> [!IMPORTANT]
+> **Historical findings record.** The results and controller descriptions in
+> this file come from superseded experiments; they must not be combined with
+> the current validation results. Use [`README.md`](README.md) and
+> `results/validation/` for the active methodology and evidence.
+
 Last updated: 2026-09-13
 
 ## 1. Status and frozen research question

@@ -165,6 +165,7 @@ class Simulator:
         stop_elapsed_h = 0.0
         productive_since_stop_h = 0.0
         stop_count = 0
+        planned_stop_used_current_field = False
         stop_request_started_h: float | None = None
         stop_durations: list[float] = []
         current_stop_duration_h = 0.0
@@ -175,9 +176,11 @@ class Simulator:
         # expensive rollout on its own 30-minute/event-driven planning clock;
         # Threshold and Reactive use the one-minute control clock.
         controller_decision_interval_h = (
-            c.predictive_decision_interval_h
-            if self.controller.name == "predictive"
-            else c.control_decision_interval_h)
+            float(getattr(self.controller, "decision_interval_h"))
+            if hasattr(self.controller, "decision_interval_h")
+            else (c.predictive_decision_interval_h
+                  if self.controller.name == "predictive"
+                  else c.control_decision_interval_h))
         next_control_decision_h = 0.0
         cached_schedule_action = HARVEST
 
@@ -227,6 +230,8 @@ class Simulator:
             stop_elapsed_h = saved["stop_elapsed_h"]
             productive_since_stop_h = saved["productive_since_stop_h"]
             stop_count = saved["stop_count"]
+            planned_stop_used_current_field = saved.get(
+                "planned_stop_used_current_field", False)
             stop_request_started_h = saved["stop_request_started_h"]
             stop_durations = deepcopy(saved["stop_durations"])
             current_stop_duration_h = saved["current_stop_duration_h"]
@@ -258,6 +263,7 @@ class Simulator:
             nonlocal pending_interior_mode, interior_mode_dwell_h
             nonlocal interior_mode_switch_remaining_h
             nonlocal field_interior_mode_switches
+            nonlocal planned_stop_used_current_field
             field = self.fields[field_index]
             d.set_field_context(field.field_id, field.one_way_travel_min)
             field_order.append(field.field_id)
@@ -267,6 +273,7 @@ class Simulator:
             interior_mode_dwell_h = 0.0
             interior_mode_switch_remaining_h = 0.0
             field_interior_mode_switches = 0
+            planned_stop_used_current_field = False
             interior_mode_sequences[field.field_id] = []
 
         def active_mode_for(task: str | None) -> str:
@@ -289,7 +296,7 @@ class Simulator:
             mode = active_mode_for(task)
             return (
                 c.combine_count_for_mode(mode),
-                c.grain_cart_count_for_mode(mode),
+                c.field_buffer_count_for_mode(mode),
             )
 
         def effective_rate_buph(field: Field, task: str, mode: str) -> float:
@@ -337,6 +344,14 @@ class Simulator:
                     ))
             return tuple(segments)
 
+        def is_field_boundary(field: Field, task: str) -> bool:
+            """Whether harvest has not yet begun on the active field."""
+            return (
+                task == OPENING
+                and abs(field.remaining_area_ac - field.total_area_ac)
+                <= c.numerical_tolerance
+            )
+
         def control_state(field: Field, task: str) -> dict[str, Any]:
             if task == OPENING:
                 available_modes = (
@@ -357,9 +372,13 @@ class Simulator:
                 + c.semi_unload_time_h
                 + c.interior_mode_switch_time_h,
             )
-            stop_eligible = (
+            stop_work_eligible = (
                 productive_since_stop_h + c.numerical_tolerance
                 >= c.stop_work_requirement_h)
+            at_field_start = is_field_boundary(field, task)
+            boundary_stop_available = (
+                at_field_start and not planned_stop_used_current_field)
+            stop_eligible = stop_work_eligible and boundary_stop_available
             hours_until_stop = max(
                 0.0, c.stop_work_requirement_h - productive_since_stop_h)
             protection_h = c.reactive_mode_horizon_h
@@ -369,17 +388,15 @@ class Simulator:
                 "geometry": field.geometry,
                 "opening_capacity_factor": field.opening_capacity_factor,
                 "remaining_grain_bu": field.remaining_grain(task),
-                "at_field_start": (
-                    task == OPENING
-                    and abs(field.remaining_area_ac - field.total_area_ac)
-                    <= c.numerical_tolerance),
+                "at_field_start": at_field_start,
+                "boundary_stop_available": boundary_stop_available,
                 "receiving_pressure": d.receiving_pressure,
                 "field_mobile_free_bu": d.field_mobile_free_bu(
                     active_combines, active_carts),
                 "field_mobile_free_by_mode": {
                     mode: d.field_mobile_free_bu(
                         c.combine_count_for_mode(mode),
-                        c.grain_cart_count_for_mode(mode))
+                        c.field_buffer_count_for_mode(mode))
                     for mode in available_modes
                 },
                 "system_buffer_free_bu": system_free_bu,
@@ -393,6 +410,9 @@ class Simulator:
                 "response_time_h": response_h,
                 "protection_h": protection_h,
                 "stop_eligible": stop_eligible,
+                "stop_work_eligible": stop_work_eligible,
+                "planned_stop_used_current_field": (
+                    planned_stop_used_current_field),
                 "hours_until_stop_eligible_h": hours_until_stop,
                 "in_stop": in_stop,
                 "stop_elapsed_h": stop_elapsed_h,
@@ -469,6 +489,16 @@ class Simulator:
             if not record_trace:
                 return
             task = active[1] if active else None
+            active_field = self.fields[active[0]] if active else None
+            at_field_start = bool(
+                active_field is not None
+                and task is not None
+                and is_field_boundary(active_field, task))
+            stop_work_eligible = (
+                productive_since_stop_h + c.numerical_tolerance
+                >= c.stop_work_requirement_h)
+            boundary_stop_available = (
+                at_field_start and not planned_stop_used_current_field)
             active_mode = active_mode_for(task) if task else ""
             active_rate_buph = 0.0
             if task:
@@ -478,7 +508,7 @@ class Simulator:
             row = {
                 "time_h": d.time_h,
                 "duration_h": duration_h,
-                "current_field": self.fields[active[0]].field_id if active else "",
+                "current_field": active_field.field_id if active_field else "",
                 "current_task": task or "",
                 "operating_mode": active_mode,
                 "effective_harvest_rate_buph": active_rate_buph,
@@ -488,15 +518,19 @@ class Simulator:
                                            if task == INTERIOR else 0.0),
                 "interior_mode_switches_current_field": field_interior_mode_switches,
                 "current_moisture_pct": (
-                    self.fields[active[0]].moisture_pct if active else ""),
+                    active_field.moisture_pct if active_field else ""),
                 "combine_state": state,
                 "event": event,
                 "controller_macro_action": getattr(
                     self.controller, "active_macro_label", ""),
                 "productive_since_stop_h": productive_since_stop_h,
                 "stop_eligible": int(
-                    productive_since_stop_h + c.numerical_tolerance
-                    >= c.stop_work_requirement_h),
+                    stop_work_eligible and boundary_stop_available),
+                "stop_work_eligible": int(stop_work_eligible),
+                "at_field_start": int(at_field_start),
+                "boundary_stop_available": int(boundary_stop_available),
+                "planned_stop_used_current_field": int(
+                    planned_stop_used_current_field),
                 "current_stop_elapsed_h": stop_elapsed_h if in_stop else 0.0,
                 "stop_request_duration_h": (
                     0.0 if stop_request_started_h is None
@@ -555,6 +589,8 @@ class Simulator:
                 "stop_elapsed_h": stop_elapsed_h,
                 "productive_since_stop_h": productive_since_stop_h,
                 "stop_count": stop_count,
+                "planned_stop_used_current_field": (
+                    planned_stop_used_current_field),
                 "stop_request_started_h": stop_request_started_h,
                 "stop_durations": stop_durations,
                 "current_stop_duration_h": current_stop_duration_h,
@@ -705,7 +741,7 @@ class Simulator:
                       >= c.maximum_dryer_idle_episode_h):
                     # The common STOP supervisor overrides a strategy before
                     # a voluntary stop can starve the continuously operated
-                    # dryer for more than the allowed one-hour episode.
+                    # dryer beyond the configured system-wide limit.
                     action = HARVEST
                 elif control_due:
                     cached_schedule_action = (
@@ -727,6 +763,19 @@ class Simulator:
                     continue
                 step = min(step, max(
                     physical_step_h, c.minimum_stop_h - stop_elapsed_h))
+                # A coarse forecast step must not jump across the same dryer
+                # continuity boundary that real one-minute execution obeys.
+                # Once a starvation episode has started, stop exactly at the
+                # remaining system allowance and let the supervisor resume on
+                # the next iteration.
+                if (d.dryer_has_started
+                        and d.current_dryer_idle_episode_h
+                        > c.numerical_tolerance):
+                    remaining_idle_h = (
+                        c.maximum_dryer_idle_episode_h
+                        - d.current_dryer_idle_episode_h)
+                    if remaining_idle_h > c.numerical_tolerance:
+                        step = min(step, remaining_idle_h)
                 dryer_before_h = d.total_dryer_operating_h
                 d.advance_time(step)
                 dryer_operating_during_stop_h += (
@@ -749,53 +798,30 @@ class Simulator:
                     self.controller.choose_schedule_action(**state))
             stop_action = cached_schedule_action
             if stop_action == STOP:
-                immediate_boundary_stop = (
-                    bool(state["at_field_start"])
-                    and bool(getattr(
-                        self.controller,
-                        "allows_immediate_boundary_stop", False)))
-                if immediate_boundary_stop:
-                    if not minimum_stop_preserves_dryer(task):
-                        cached_schedule_action = HARVEST
-                        stop_request_started_h = None
-                        record(
-                            "STOP_REJECTED", current,
-                            event="DRYER_CONTINUITY_GUARD")
-                        continue
-                    in_stop = True
-                    stop_elapsed_h = 0.0
-                    current_stop_duration_h = 0.0
-                    cached_schedule_action = STOP
-                    stop_count += 1
-                    stop_start_inventories.append(d.wet_bin_inventory_bu)
-                    d.dispatch_partial_loads(*active_storage_context(task))
+                if not (state["at_field_start"]
+                        and state["boundary_stop_available"]):
+                    raise AssertionError(
+                        "Shared STOP supervisor allowed a non-boundary STOP")
+                if not minimum_stop_preserves_dryer(task):
+                    cached_schedule_action = HARVEST
+                    stop_request_started_h = None
                     record(
-                        "STOP_START", current,
-                        event="VOLUNTARY_STOP_START")
+                        "STOP_REJECTED", current,
+                        event="DRYER_CONTINUITY_GUARD")
                     continue
-                if stop_request_started_h is None:
-                    stop_request_started_h = d.time_h
-                confirmed_h = d.time_h - stop_request_started_h
-                if (confirmed_h + c.numerical_tolerance
-                        >= c.stop_signal_confirmation_h):
-                    if not minimum_stop_preserves_dryer(task):
-                        cached_schedule_action = HARVEST
-                        stop_request_started_h = None
-                        record(
-                            "STOP_REJECTED", current,
-                            event="DRYER_CONTINUITY_GUARD")
-                        continue
-                    in_stop = True
-                    stop_elapsed_h = 0.0
-                    current_stop_duration_h = 0.0
-                    cached_schedule_action = STOP
-                    stop_count += 1
-                    stop_start_inventories.append(d.wet_bin_inventory_bu)
-                    d.dispatch_partial_loads(*active_storage_context(task))
-                    record(
-                        "STOP_START", current,
-                        event="VOLUNTARY_STOP_START")
-                    continue
+                in_stop = True
+                stop_elapsed_h = 0.0
+                current_stop_duration_h = 0.0
+                cached_schedule_action = STOP
+                stop_request_started_h = None
+                stop_count += 1
+                planned_stop_used_current_field = True
+                stop_start_inventories.append(d.wet_bin_inventory_bu)
+                d.dispatch_partial_loads(*active_storage_context(task))
+                record(
+                    "STOP_START", current,
+                    event="VOLUNTARY_STOP_START")
+                continue
             else:
                 stop_request_started_h = None
 
@@ -842,8 +868,9 @@ class Simulator:
                 mode = current_interior_mode
 
             active_combines = c.combine_count_for_mode(mode)
-            active_carts = c.grain_cart_count_for_mode(mode)
-            d.unload_field_storage(active_combines, active_carts)
+            productive_carts = c.grain_cart_count_for_mode(mode)
+            active_buffers = c.field_buffer_count_for_mode(mode)
+            d.unload_field_storage(active_combines, active_buffers)
             free_tank_bu = d.active_combine_free_bu(active_combines)
             if free_tank_bu <= c.numerical_tolerance:
                 d.advance_time(step)
@@ -900,7 +927,7 @@ class Simulator:
             record(
                 "HARVESTING", current, step,
                 productive_combine_count=working_combine_count,
-                productive_grain_cart_count=active_carts,
+                productive_grain_cart_count=productive_carts,
             )
             if task not in field.available_tasks():
                 current = None
@@ -954,8 +981,16 @@ class Simulator:
             if duration_h > c.forced_block_ignore_h + c.numerical_tolerance]
         meaningful_forced_h = sum(meaningful_forced_episodes_h)
 
+        controller_implementation = {
+            "fixed": "fixed_fastest_feasible",
+            "threshold": "static_pressure_threshold",
+            "reactive": "eta_aware_current_state",
+            "predictive": "legacy_one_step",
+        }.get(self.controller.name, self.controller.name)
+
         metrics: dict[str, float | int | str] = {
             "policy": self.controller.name,
+            "controller_implementation": controller_implementation,
             "research_question": (
                 "When does predictive coordination provide additional value over "
                 "current-state reactive coordination under downstream constraints?"),
@@ -978,6 +1013,9 @@ class Simulator:
             "opening_area_fraction": c.opening_area_fraction,
             "grain_leg_rate_buph": c.grain_leg_rate_buph,
             "wet_bin_capacity_bu": c.wet_bin_capacity_bu,
+            "wet_bin_control_limit_fraction": (
+                c.wet_bin_control_limit_fraction),
+            "wet_bin_control_reserve_bu": c.wet_bin_control_reserve_bu,
             "dryer_intercept_buph": c.dryer_intercept_buph,
             "dryer_moisture_slope_buph_per_pct": c.dryer_moisture_slope_buph_per_pct,
             "interior_1c_rate_buph": c.interior_1c_rate_buph,
@@ -1001,6 +1039,8 @@ class Simulator:
             "stop_work_requirement_h": c.stop_work_requirement_h,
             "minimum_stop_h": c.minimum_stop_h,
             "stop_signal_confirmation_h": c.stop_signal_confirmation_h,
+            "planned_stop_location_rule": "field_boundary_only",
+            "maximum_planned_stops_per_field": 1,
             "maximum_dryer_idle_episode_limit_h": (
                 c.maximum_dryer_idle_episode_h),
             "forced_block_ignore_h": c.forced_block_ignore_h,
@@ -1024,6 +1064,7 @@ class Simulator:
             "grain_cart_capacity_bu": c.grain_cart_capacity_bu,
             "n_combines": c.n_combines,
             "n_grain_carts": c.n_grain_carts,
+            "use_field_buffer": c.use_field_buffer,
             "n_semis": c.n_semis,
             "semi_count": c.n_semis,
             "semi_capacity_bu": c.semi_capacity_bu,

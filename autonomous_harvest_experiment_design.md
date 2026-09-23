@@ -1,5 +1,12 @@
 # Autonomous Harvest Coordination: Frozen Exploratory Experiment Design
 
+> [!IMPORTANT]
+> **Historical design record.** This document preserves an earlier experiment
+> definition and is not the specification for the current controller or
+> validation suite. In particular, references to 12 h/8 h STOP rules, 15 min
+> control, or a 48 h Beam/rollout design are superseded. Use
+> [`README.md`](README.md) and the current code for the active methodology.
+
 ## 1. Frozen research question
 
 > **When does predictive coordination provide additional value over current-state reactive coordination under downstream constraints?**

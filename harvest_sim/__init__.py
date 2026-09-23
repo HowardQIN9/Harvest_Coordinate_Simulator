@@ -9,10 +9,12 @@ from .config import (INTERIOR_MODES, MIN_PREDICTION_HORIZON_H,
                      FieldSpec, OperatingMode, SimulationConfig)
 from .downstream import Vehicle
 from .field import Field, FieldGenerator, FieldSelector, FixedOrderFieldSelector
+from .scenario import FieldScenarioGenerator
 from .simulator import SimulationResult, Simulator
 
 __all__ = [
-    "Field", "FieldSpec", "FieldGenerator", "FieldSelector",
+    "Field", "FieldSpec", "FieldGenerator", "FieldScenarioGenerator",
+    "FieldSelector",
     "FixedOrderFieldSelector", "OperatingMode", "OPERATING_MODES",
     "SimulationConfig", "SimulationResult", "Simulator", "Vehicle",
     "DAILY_MACHINE_HOUR_FIELDS", "calculate_daily_machine_hours",
