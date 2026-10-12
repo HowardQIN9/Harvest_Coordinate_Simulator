@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="620" viewBox="0 0 1100 620">
+<rect width="1100" height="620" fill="white"/>
+<g font-family="Arial" font-size="16" fill="#19324a">
+<text x="30" y="32" font-size="23">Lowest-cost candidates (illustrative USD assumptions)</text>
+<text x="20" y="85">1.0C/0.0GC/1.0S reactive</text>
+<rect x="420" y="65" width="433.73038583462755" height="28" fill="#167d8d"/>
+<text x="863.7303858346276" y="85">$138,333</text>
+<text x="20" y="128">1.0C/0.0GC/1.0S threshold</text>
+<rect x="420" y="108" width="440.7207640048913" height="28" fill="#8bbcc5"/>
+<text x="870.7207640048913" y="128">$140,563</text>
+<text x="20" y="171">1.0C/0.0GC/1.0S fixed</text>
+<rect x="420" y="151" width="445.19312842901934" height="28" fill="#8bbcc5"/>
+<text x="875.1931284290193" y="171">$141,989</text>
+<text x="20" y="214">1.0C/0.0GC/1.0S constant_1C_1C</text>
+<rect x="420" y="194" width="445.19312842901934" height="28" fill="#8bbcc5"/>
+<text x="875.1931284290193" y="214">$141,989</text>
+<text x="20" y="257">1.0C/0.0GC/2.0S threshold</text>
+<rect x="420" y="237" width="514.8393405349448" height="28" fill="#8bbcc5"/>
+<text x="944.8393405349448" y="257">$164,202</text>
+<text x="20" y="300">1.0C/1.0GC/1.0S reactive</text>
+<rect x="420" y="280" width="518.8893101214668" height="28" fill="#8bbcc5"/>
+<text x="948.8893101214668" y="300">$165,494</text>
+<text x="20" y="343">1.0C/0.0GC/2.0S reactive</text>
+<rect x="420" y="323" width="519.0798799209786" height="28" fill="#8bbcc5"/>
+<text x="949.0798799209786" y="343">$165,554</text>
+<text x="20" y="386">1.0C/1.0GC/1.0S threshold</text>
+<rect x="420" y="366" width="522.6135234190222" height="28" fill="#8bbcc5"/>
+<text x="952.6135234190222" y="386">$166,681</text>
+<text x="20" y="429">1.0C/1.0GC/1.0S fixed</text>
+<rect x="420" y="409" width="535.829993374517" height="28" fill="#8bbcc5"/>
+<text x="965.829993374517" y="429">$170,897</text>
+<text x="20" y="472">1.0C/1.0GC/1.0S constant_1C_1C</text>
+<rect x="420" y="452" width="535.829993374517" height="28" fill="#8bbcc5"/>
+<text x="965.829993374517" y="472">$170,897</text>
+<text x="20" y="515">1.0C/0.0GC/2.0S fixed</text>
+<rect x="420" y="495" width="540.0" height="28" fill="#8bbcc5"/>
+<text x="970.0" y="515">$172,227</text>
+<text x="20" y="558">1.0C/0.0GC/2.0S constant_1C_1C</text>
+<rect x="420" y="538" width="540.0" height="28" fill="#8bbcc5"/>
+<text x="970.0" y="558">$172,227</text>
+<text x="20" y="605">Minimum within enumerated choices; equipment prices require farm calibration.</text>
+</g></svg>

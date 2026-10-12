@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from math import isfinite
 from random import Random
+from .costs import CostConfig
 
 
 MODE_1C = "1C"
@@ -61,6 +62,7 @@ DEFAULT_FIELDS = (
 
 @dataclass(frozen=True)
 class SimulationConfig:
+    cost_config: CostConfig = CostConfig()
     field_specs: tuple[FieldSpec, ...] = DEFAULT_FIELDS
     fixed_field_order_ids: tuple[str, ...] = ()
     default_field_order_rule: str = "far_to_near"

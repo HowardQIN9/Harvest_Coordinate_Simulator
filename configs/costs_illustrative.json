@@ -1,0 +1,36 @@
+{
+  "combine": {
+    "purchase_usd": 500000,
+    "salvage_usd": 150000,
+    "life_years": 10,
+    "horsepower": 400,
+    "repair_usd_per_active_h": 35
+  },
+  "grain_cart": {
+    "purchase_usd": 250000,
+    "salvage_usd": 75000,
+    "life_years": 12,
+    "horsepower": 250,
+    "repair_usd_per_active_h": 15
+  },
+  "semi": {
+    "purchase_usd": 150000,
+    "salvage_usd": 45000,
+    "life_years": 10,
+    "horsepower": 400,
+    "repair_usd_per_active_h": 12
+  },
+  "interest_rate": 0.05,
+  "campaign_ownership_share": 1.0,
+  "diesel_usd_per_gal": 2.89,
+  "labor_usd_per_h": 24.45,
+  "idle_fuel_fraction": 0.1,
+  "drying_usd_per_bu_point": 0.055,
+  "target_moisture_pct": 15.0,
+  "grain_leg_usd_per_bu": 0.005,
+  "wet_bin_usd_per_bu_h": 0.0,
+  "dryer_annual_ownership_usd": 0.0,
+  "grain_leg_annual_ownership_usd": 5000.0,
+  "wet_bin_annual_ownership_usd": 3000.0,
+  "delay_usd_per_h": 0.0
+}

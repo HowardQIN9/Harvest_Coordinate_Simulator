@@ -6,6 +6,7 @@ from math import isfinite
 from typing import Any
 
 from .accounting import calculate_daily_machine_hours, summarize_machine_hours
+from .costs import calculate_costs
 from .config import (
     INTERIOR_MODES,
     MODE_1C,
@@ -1150,6 +1151,7 @@ class Simulator:
             meaningful_forced_episodes_h)
         daily_machine_hours = calculate_daily_machine_hours(series, c.semi_count)
         metrics.update(summarize_machine_hours(daily_machine_hours))
+        metrics.update(calculate_costs(metrics, c, self.fields, c.cost_config))
         return SimulationResult(
             self.controller.name,
             metrics,
